@@ -32,11 +32,12 @@ The bias is toward SPLITTING rather than merging. A duplicate exercise is
 announced in the reply and removed with one `delete_log_entry` call; a wrong
 merge quietly corrupts a history and is noticed months later, in a chart.
 
-EVERY FIELD IS FREE TEXT AND OPTIONAL. A run has a duration and a note about
-distance; a lift has sets, reps and weight. Forcing either shape onto the
-other loses information, so all five are stored exactly as spoken and numbers
-are parsed out only when something needs to compare them (`show_progress`).
-That also means "3x8", "8, 8, 6" and "185 lbs" all survive intact.
+EVERY FIELD IS FREE TEXT AND OPTIONAL. A run has a distance and a duration; a
+lift has sets, reps and weight; a Stairmaster has steps. Forcing any one shape
+onto the others loses information, so all seven are stored exactly as spoken
+and numbers are parsed out only when something needs to compare them
+(`show_progress`). That also means "3x8", "8, 8, 6", "185 lbs" and "5k" all
+survive intact.
 
 DELETE EXISTS FROM DAY ONE. Both of the MCPs built here before this one
 shipped without a delete tool and both left permanent test rows in real
@@ -132,6 +133,8 @@ def _init_db() -> None:
                 reps        TEXT NOT NULL DEFAULT '',
                 weight      TEXT NOT NULL DEFAULT '',
                 duration    TEXT NOT NULL DEFAULT '',
+                distance    TEXT NOT NULL DEFAULT '',
+                steps       TEXT NOT NULL DEFAULT '',
                 notes       TEXT NOT NULL DEFAULT '',
                 created_at  TEXT NOT NULL
             );
@@ -142,6 +145,18 @@ def _init_db() -> None:
                 ON log_entries(exercise_id, date);
             """
         )
+        # Columns added after the first release. The volume holding this
+        # database is durable and holds real history, so new measurement
+        # fields arrive by ALTER TABLE at startup rather than by recreating
+        # the table: an existing row keeps its data and simply gets '' for
+        # anything it never recorded, which is what every other optional
+        # field already means.
+        have = {r["name"] for r in _db.execute("PRAGMA table_info(log_entries)")}
+        for column in ("distance", "steps"):
+            if column not in have:
+                _db.execute(f"ALTER TABLE log_entries ADD COLUMN {column} "
+                            f"TEXT NOT NULL DEFAULT ''")
+                logger.info("migrated log_entries: added %s", column)
         _db.commit()
 
 
@@ -466,6 +481,53 @@ def _total_reps(row: sqlite3.Row) -> float | None:
     return reps[0] * sets if sets else reps[0]
 
 
+def _steps(text: str) -> float | None:
+    """Step count from free text. '2000', '2,000 steps', '1000 + 1000' -> 2000.
+
+    Digit-grouping commas are stripped first: '2,000' would otherwise read as
+    two numbers and total 2.
+    """
+    raw = re.sub(r"(?<=\d),(?=\d\d\d)", "", (text or ""))
+    nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", raw)]
+    return sum(nums) if nums else None
+
+
+# Only the units that actually get said out loud. Anything unrecognized falls
+# through to miles, which is the right default here and keeps a mistranscribed
+# unit from throwing the number away.
+_MILE_UNITS = {"", "mi", "mile", "miles"}
+_KM_UNITS = {"k", "km", "kms", "kilometer", "kilometers",
+             "kilometre", "kilometres"}
+_METER_UNITS = {"m", "meter", "meters", "metre", "metres"}
+
+
+def _distance(text: str) -> tuple[float, str] | None:
+    """Distance as (value, unit) with unit 'mi' or 'km', or None.
+
+    '3.1 miles' -> (3.1, 'mi'); '5k' and '5 km' -> (5.0, 'km'); '400m' ->
+    (0.4, 'km'). A bare number is miles. Deliberately shallow -- this is a
+    personal log, and the stored text is always the text that was said.
+    """
+    raw = re.sub(r"(?<=\d),(?=\d\d\d)", "", (text or "").strip().lower())
+    m = re.search(r"(\d+(?:\.\d+)?)\s*([a-z]*)", raw)
+    if not m:
+        return None
+    value, unit = float(m.group(1)), m.group(2)
+    if value <= 0:
+        return None
+    if unit in _KM_UNITS:
+        return value, "km"
+    if unit in _METER_UNITS:
+        return value / 1000.0, "km"
+    if unit not in _MILE_UNITS:
+        # Same call as `_parse_period` makes: a unit nobody recognizes is not
+        # worth throwing the number away over. Logged so a repeatedly
+        # mistranscribed one is findable.
+        logger.info("unrecognized distance unit %r in %r, reading as miles",
+                    unit, text)
+    return value, "mi"
+
+
 def _minutes(text: str) -> float | None:
     """Duration in minutes. '45 min', '1h 05', '30:00' all land sensibly."""
     raw = (text or "").strip().lower()
@@ -491,10 +553,38 @@ def _minutes(text: str) -> float | None:
     return bare  # "45" on its own is 45 minutes
 
 
+def _col(row: sqlite3.Row, name: str) -> str:
+    """A column that may predate a migration, as text.
+
+    The open connection is shared and long-lived; this keeps a row read before
+    a column existed from raising instead of reading as empty.
+    """
+    try:
+        return (row[name] or "").strip()
+    except (IndexError, KeyError):
+        return ""
+
+
+def _pace(row: sqlite3.Row) -> str:
+    """Pace for one entry -- '8:45/mi' -- when it has both distance and time.
+
+    Only a row carrying both can have a pace; a distance with no duration and
+    a duration with no distance both correctly return nothing.
+    """
+    dist = _distance(_col(row, "distance"))
+    mins = _minutes(_col(row, "duration"))
+    if not dist or not mins:
+        return ""
+    value, unit = dist
+    return _fmt(mins / value, "pace", unit)
+
+
 def _describe(row: sqlite3.Row) -> str:
-    """One entry as a phrase: '3 sets of 8 at 185 lbs'."""
+    """One entry as a phrase: '3 sets of 8 at 185 lbs', '3.1 miles for 26:00
+    at 8:23/mi', '2,000 steps for 20 min'."""
     sets, reps = (row["sets"] or "").strip(), (row["reps"] or "").strip()
     weight, dur = (row["weight"] or "").strip(), (row["duration"] or "").strip()
+    distance, steps = _col(row, "distance"), _col(row, "steps")
     notes = (row["notes"] or "").strip()
 
     bits = []
@@ -504,6 +594,14 @@ def _describe(row: sqlite3.Row) -> str:
         bits.append(f"{sets} sets")
     elif reps:
         bits.append(f"{reps} reps")
+    # Same rule as weight below: only supply a unit when the caller gave a
+    # bare number, so "5k" and "2000 steps" are not restated with one.
+    if distance:
+        unit = "" if re.search(r"[a-z]", distance, re.I) else " miles"
+        bits.append(f"{distance}{unit}")
+    if steps:
+        unit = "" if re.search(r"[a-z]", steps, re.I) else " steps"
+        bits.append(f"{steps}{unit}")
     if weight:
         # "at bodyweight" reads better than "at bodyweight lbs"; only append a
         # unit when the caller gave a bare number.
@@ -511,6 +609,9 @@ def _describe(row: sqlite3.Row) -> str:
         bits.append(f"at {weight}{unit}")
     if dur:
         bits.append(f"for {dur}")
+    pace = _pace(row)
+    if pace:
+        bits.append(f"at {pace}")
     if notes:
         bits.append(f"({notes})")
     return " ".join(bits)
@@ -543,7 +644,8 @@ def _sessions(exercise_id: int, since: date | None = None) -> list[dict]:
     for row in _query(sql, args):
         day = by_day.setdefault(row["date"], {
             "date": row["date"], "rows": [], "top_weight": None,
-            "best_reps": None, "total_reps": 0.0, "minutes": 0.0, "sets": 0.0})
+            "best_reps": None, "total_reps": 0.0, "minutes": 0.0, "sets": 0.0,
+            "steps": 0.0, "distance": 0.0, "distance_unit": None, "pace": None})
         day["rows"].append(row)
         w = _max_num(row["weight"])
         if w is not None:
@@ -556,7 +658,31 @@ def _sessions(exercise_id: int, since: date | None = None) -> list[dict]:
         day["total_reps"] += _total_reps(row) or 0.0
         day["minutes"] += _minutes(row["duration"]) or 0.0
         day["sets"] += _num(row["sets"]) or 0.0
+        day["steps"] += _steps(_col(row, "steps")) or 0.0
+        dist = _distance(_col(row, "distance"))
+        if dist:
+            value, unit = dist
+            # A day's distance is one number, so the first unit seen that day
+            # wins and anything else converts into it. Mixing miles and
+            # kilometres inside one session is vanishingly rare; silently
+            # adding 5 km to 3 miles would not be.
+            if day["distance_unit"] is None:
+                day["distance_unit"] = unit
+            elif unit != day["distance_unit"]:
+                value *= 0.621371 if unit == "km" else 1.609344
+            day["distance"] += value
+
+    for day in by_day.values():
+        # Pace is per session, not per row: a 3-mile run logged as two entries
+        # still has one pace, and it is the day's time over the day's distance.
+        if day["distance"] and day["minutes"]:
+            day["pace"] = day["minutes"] / day["distance"]
     return list(by_day.values())
+
+
+# Metrics where a smaller number is a better session. Pace is the only one:
+# every other number here is "more is better".
+_LOWER_IS_BETTER = {"pace"}
 
 
 def _metric(sessions: list[dict]) -> tuple[str, str]:
@@ -565,8 +691,16 @@ def _metric(sessions: list[dict]) -> tuple[str, str]:
     Picked from the data, not from a category list: whatever most sessions
     actually recorded is what "progress" means for that movement. A lift gets
     weight, a run gets duration, a bodyweight movement gets reps.
+
+    Steps, pace and distance come first, but only fire for an exercise that
+    actually records them -- an entry with neither field scores zero on all
+    three and falls through to exactly the pick it had before they existed.
+    A run logged with both a distance and a time is measured on pace; with a
+    distance alone, on distance; with a time alone, on duration as before.
     """
-    for key, label in (("top_weight", "weight"), ("minutes", "duration"),
+    for key, label in (("steps", "steps"), ("pace", "pace"),
+                       ("distance", "distance"),
+                       ("top_weight", "weight"), ("minutes", "duration"),
                        ("total_reps", "total reps")):
         if sum(1 for s in sessions if s.get(key)) >= max(1, len(sessions) // 2):
             return key, label
@@ -588,6 +722,14 @@ def _trend(sessions: list[dict], key: str) -> str:
     if not earlier:
         return ""
     change = (recent - earlier) / earlier
+    if key in _LOWER_IS_BETTER:
+        # A falling pace is a faster runner, so say that rather than leaving
+        # "trending down" to be read as getting worse.
+        if change < -0.03:
+            return "getting faster"
+        if change > 0.03:
+            return "getting slower"
+        return "holding steady"
     if change > 0.03:
         return "trending up"
     if change < -0.03:
@@ -595,9 +737,26 @@ def _trend(sessions: list[dict], key: str) -> str:
     return "holding steady"
 
 
-def _fmt(value: float, key: str) -> str:
+def _best(sessions: list[dict], key: str) -> float | None:
+    """The best value of `key` across sessions -- smallest, for pace."""
+    values = [s[key] for s in sessions if s.get(key)]
+    if not values:
+        return None
+    return min(values) if key in _LOWER_IS_BETTER else max(values)
+
+
+def _fmt(value: float, key: str, unit: str = "mi") -> str:
     if key == "minutes":
         return f"{value:,.0f} min"
+    if key == "steps":
+        return f"{value:,.0f} steps"
+    if key == "pace":
+        # Minutes-per-unit as mm:ss, the way a pace is read out loud.
+        mins, secs = divmod(int(round(value * 60)), 60)
+        return f"{mins}:{secs:02d}/{unit}"
+    if key == "distance":
+        text = f"{value:,.2f}".rstrip("0").rstrip(".")
+        return f"{text} {unit}"
     text = f"{value:,.1f}".rstrip("0").rstrip(".")
     return f"{text} lbs" if key == "top_weight" else text
 
@@ -611,8 +770,8 @@ mcp = FastMCP("workout")
 
 @mcp.tool
 def log_exercise(exercise: str, sets: str = "", reps: str = "",
-                 weight: str = "", duration: str = "", notes: str = "",
-                 date: str = "") -> str:
+                 weight: str = "", duration: str = "", distance: str = "",
+                 steps: str = "", notes: str = "", date: str = "") -> str:
     """Log an exercise you did. This is the main tool -- use it for anything
     that sounds like recording a workout.
 
@@ -623,8 +782,9 @@ def log_exercise(exercise: str, sets: str = "", reps: str = "",
     tool for adding an exercise.
 
     Fill in only the fields that apply. A lift usually has sets, reps and
-    weight; a run or a hold usually has a duration and maybe a note about
-    distance. Nothing is required except the name.
+    weight; a run usually has a distance and a duration, which together give
+    a pace; a Stairmaster or a walk usually has steps. Nothing is required
+    except the name.
 
     Args:
         exercise: What you did, in plain words, e.g. "bench press",
@@ -635,15 +795,20 @@ def log_exercise(exercise: str, sets: str = "", reps: str = "",
         weight: Weight, e.g. "185", "185 lbs", "bodyweight", "45 kg".
             A bare number is read as pounds. Leave empty if it doesn't apply.
         duration: How long, e.g. "30 min", "1h 10", "22:30". Leave empty
-            if it doesn't apply.
-        notes: Anything else worth keeping -- "3.1 miles", "felt easy",
+            if it doesn't apply. Given alongside a distance, this is what
+            makes a pace.
+        distance: How far, e.g. "3.1 miles", "5k", "400m". A bare number is
+            read as miles. Leave empty if it doesn't apply.
+        steps: How many steps, e.g. "2000" for a Stairmaster session.
+            Leave empty if it doesn't apply.
+        notes: Anything else worth keeping -- "felt easy", "level 12",
             "left shoulder twinge".
         date: When, e.g. "today", "yesterday", "Monday" or "2026-09-02".
             Leave as an empty string for today.
     """
     logger.info("log_exercise: %r sets=%r reps=%r weight=%r duration=%r "
-                "notes=%r date=%r", exercise, sets, reps, weight, duration,
-                notes, date)
+                "distance=%r steps=%r notes=%r date=%r", exercise, sets, reps,
+                weight, duration, distance, steps, notes, date)
     try:
         when = _parse_date(date)
         if not (exercise or "").strip():
@@ -660,10 +825,11 @@ def log_exercise(exercise: str, sets: str = "", reps: str = "",
 
     entry_id = _write(
         "INSERT INTO log_entries (exercise_id, date, sets, reps, weight, "
-        "duration, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "duration, distance, steps, notes, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (row["id"], when.isoformat(), sets.strip(), reps.strip(),
-         weight.strip(), duration.strip(), notes.strip(),
-         datetime.now(TZ).isoformat(timespec="seconds")))
+         weight.strip(), duration.strip(), distance.strip(), steps.strip(),
+         notes.strip(), datetime.now(TZ).isoformat(timespec="seconds")))
 
     saved = _query("SELECT e.*, x.name FROM log_entries e "
                    "JOIN exercises x ON x.id = e.exercise_id "
@@ -720,10 +886,11 @@ def show_progress(exercise: str, period: str = "") -> str:
     tracked list the same way `log_exercise` matches it.
 
     "Progress" is measured on whichever number that exercise actually
-    records: top weight for a lift, duration for a run, total reps for a
-    bodyweight movement. The trend compares the last few sessions against
-    the few before them, and stays quiet until there are at least four
-    sessions to compare.
+    records: top weight for a lift, steps for a Stairmaster, pace for a run
+    logged with both a distance and a time, distance or duration for one
+    logged with only one of them, and total reps for a bodyweight movement.
+    The trend compares the last few sessions against the few before them,
+    and stays quiet until there are at least four sessions to compare.
 
     Args:
         exercise: Which exercise, e.g. "bench", "squats", "running".
@@ -754,13 +921,18 @@ def show_progress(exercise: str, period: str = "") -> str:
     count = "1 session" if len(sessions) == 1 else f"{len(sessions)} sessions"
     head = f"{row['name']}: {count}{head_period}"
 
-    best = max((s[key] for s in sessions if s.get(key)), default=None)
+    best = _best(sessions, key)
     if best is not None:
         best_day = next(s for s in sessions if s.get(key) == best)
         day = _say_date(_iso(best_day["date"]))
         # "on Thursday" reads well; "on today" does not.
         when = day if day in ("today", "yesterday") else f"on {day}"
-        head += f". Best {label} {_fmt(best, key)} {when}"
+        unit = best_day.get("distance_unit") or "mi"
+        said = _fmt(best, key, unit)
+        # "Best weight 200 lbs" needs the label; "Best steps 2,200 steps"
+        # says it twice, because the formatted value already carries the word.
+        named = "" if said.endswith(f" {label}") else f"{label} "
+        head += f". Best {named}{said} {when}"
 
     trend = _trend(sessions, key)
     if trend:
@@ -959,6 +1131,10 @@ def _session_payload(exercise_id: int, limit: int = 30) -> list[dict]:
             "total_reps": s["total_reps"] or None,
             "minutes": round(s["minutes"], 1) or None,
             "sets": s["sets"] or None,
+            "steps": s["steps"] or None,
+            "distance": round(s["distance"], 2) or None,
+            "distance_unit": s["distance_unit"],
+            "pace": round(s["pace"], 3) if s["pace"] else None,
             "detail": "; ".join(filter(None, (_describe(r) for r in s["rows"]))),
         })
     return out
@@ -981,12 +1157,15 @@ async def api_exercises(request: Request) -> JSONResponse:
     for r in rows:
         sessions = _sessions(r["id"])
         key, label = _metric(sessions) if sessions else ("top_weight", "weight")
-        best = max((s[key] for s in sessions if s.get(key)), default=None)
+        # Distance and pace are the only metrics whose unit isn't fixed, and
+        # the dashboard formats numbers itself, so it needs to be told which.
+        unit = next((s["distance_unit"] for s in sessions
+                     if s.get("distance_unit")), "mi")
         out.append({
             "id": r["id"], "name": r["name"], "entries": r["entries"],
             "last": r["last"], "sessions": len(sessions),
-            "metric": key, "metric_label": label,
-            "best": best, "trend": _trend(sessions, key),
+            "metric": key, "metric_label": label, "metric_unit": unit,
+            "best": _best(sessions, key), "trend": _trend(sessions, key),
             "history": _session_payload(r["id"]),
         })
     return JSONResponse({"exercises": out, "today": _today().isoformat()})

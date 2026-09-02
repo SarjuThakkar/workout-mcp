@@ -165,16 +165,29 @@
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
 
-  function fmt(v, metric) {
+  // Mirrors _fmt() on the server. `unit` only matters for distance and pace,
+  // the two metrics whose unit comes from what was said rather than being
+  // fixed; the API sends it as metric_unit.
+  function fmt(v, metric, unit) {
     if (v == null) return "";
+    unit = unit || "mi";
     if (metric === "minutes") return Math.round(v) + " min";
+    if (metric === "steps") return Math.round(v).toLocaleString() + " steps";
+    if (metric === "pace") {
+      var total = Math.round(v * 60);
+      var mins = Math.floor(total / 60), secs = total % 60;
+      return mins + ":" + (secs < 10 ? "0" : "") + secs + "/" + unit;
+    }
+    if (metric === "distance") {
+      return (Math.round(v * 100) / 100) + " " + unit;
+    }
     var n = Math.round(v * 10) / 10;
     return metric === "top_weight" ? n + " lbs" : String(n);
   }
 
   function trendClass(t) {
-    if (t === "trending up") return "up";
-    if (t === "trending down") return "down";
+    if (t === "trending up" || t === "getting faster") return "up";
+    if (t === "trending down" || t === "getting slower") return "down";
     return "flat";
   }
 
@@ -199,8 +212,8 @@
 
       var pills = "";
       if (ex.best != null) {
-        pills += '<span class="pill">Best ' + esc(fmt(ex.best, ex.metric)) +
-                 '</span>';
+        pills += '<span class="pill">Best ' +
+                 esc(fmt(ex.best, ex.metric, ex.metric_unit)) + '</span>';
       }
       if (ex.trend) {
         pills += '<span class="pill ' + trendClass(ex.trend) + '">' +
@@ -246,6 +259,14 @@
     var muted = style.getPropertyValue("--muted").trim() || "#6b7480";
     var line = style.getPropertyValue("--line").trim() || "#e3e6ea";
 
+    // A pace is minutes as a decimal -- 8.38 on an axis is unreadable, so
+    // those ticks get the mm:ss treatment. Every other metric keeps Chart.js's
+    // own tick labels, so no existing chart changes.
+    var yTicks = { color: muted, font: { size: 10 } };
+    if (ex.metric === "pace") {
+      yTicks.callback = function (v) { return fmt(v, "pace", ex.metric_unit); };
+    }
+
     if (charts[ex.id]) charts[ex.id].destroy();
     charts[ex.id] = new Chart(canvas.getContext("2d"), {
       type: "line",
@@ -269,7 +290,9 @@
           legend: { display: false },
           tooltip: {
             callbacks: {
-              label: function (c) { return fmt(c.parsed.y, ex.metric); }
+              label: function (c) {
+                return fmt(c.parsed.y, ex.metric, ex.metric_unit);
+              }
             }
           }
         },
@@ -277,8 +300,7 @@
           x: { ticks: { color: muted, font: { size: 10 }, maxRotation: 0,
                         autoSkipPadding: 12 },
                grid: { display: false } },
-          y: { ticks: { color: muted, font: { size: 10 } },
-               grid: { color: line }, beginAtZero: false }
+          y: { ticks: yTicks, grid: { color: line }, beginAtZero: false }
         }
       }
     });

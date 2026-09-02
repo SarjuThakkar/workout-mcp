@@ -25,7 +25,7 @@ python workout_mcp_server.py
 
 | Tool | What it does |
 |---|---|
-| `log_exercise(exercise, sets="", reps="", weight="", duration="", notes="", date="")` | Logs one entry. Matches `exercise` to a known one, or creates it and says so. |
+| `log_exercise(exercise, sets="", reps="", weight="", duration="", distance="", steps="", notes="", date="")` | Logs one entry. Matches `exercise` to a known one, or creates it and says so. |
 | `list_exercises()` | The exercises tracked so far, how often, and when each was last done. |
 | `show_progress(exercise, period="")` | Recent sessions, best effort, and whether it's trending up. |
 | `show_workout_log(date="")` | A day's entries, or the last seven days. Summary first, then the items. |
@@ -110,24 +110,43 @@ actually records, chosen from the data rather than from a category list:
 
 | Metric | Chosen when | Used for |
 |---|---|---|
-| top weight | at least half the sessions logged a weight | lifts |
-| duration | …a duration | runs, holds, cardio |
+| steps | at least half the sessions logged steps | Stairmaster, walks |
+| pace | …both a distance and a duration | runs |
+| distance | …a distance and no duration | runs logged by distance alone |
+| top weight | …a weight | lifts |
+| duration | …a duration | holds, cardio with no distance |
 | total reps | otherwise | bodyweight movements |
+
+The first four are checked before weight and duration, but only ever fire for
+an exercise that actually records them — an entry with no `steps` and no
+`distance` scores zero on all of them and falls through to exactly the pick it
+had before those fields existed.
 
 - A **session is a day, not a row.** Three straight sets logged as three
   separate calls are one session. Comparing rows would report a trend from
   how the logging happened rather than from the training.
 - **Best** is the maximum of that metric over the window, with the day it
-  happened.
+  happened — except **pace**, where the best session is the *fastest*, so it
+  is the minimum.
 - **Trend** compares the mean of the last up-to-3 sessions against the 3
   before, and needs **four sessions before it says anything at all** — with
   two or three, one deload week or one heavy single reads as a trend when it
   isn't. Over ±3% is "trending up"/"trending down"; inside it is "holding
-  steady".
+  steady". Pace says "getting faster"/"getting slower" instead, because a
+  falling pace is an improvement and "trending down" would read as the
+  opposite.
+- **Pace is per session, not per row**: a 3-mile run logged as two entries has
+  one pace, the day's time over the day's distance. `show_workout_log` and the
+  activity feed still show a per-entry pace on any entry that carries both.
 
 Numbers are parsed out of the free text only at read time — `"8, 8, 6"` is
-three sets' reps, `"185 lbs"` is 185, `"1h 10"` and `"22:30"` are minutes. The
-stored text is always exactly what was said.
+three sets' reps, `"185 lbs"` is 185, `"1h 10"` and `"22:30"` are minutes,
+`"2,000"` is 2000 steps. The stored text is always exactly what was said.
+
+Distance parsing is deliberately shallow: `"3.1 miles"` is miles, `"5k"`,
+`"5 km"` and `"400m"` are kilometres (metres divided down), and a bare number
+is miles. A day that somehow mixes the two converts into whichever unit came
+first that day.
 
 ## Storage
 
@@ -136,14 +155,20 @@ SQLite, in a Docker named volume so it survives a rebuild.
 ```sql
 exercises    (id, name, norm UNIQUE, created_at)
 log_entries  (id, exercise_id, date, sets, reps, weight,
-              duration, notes, created_at)
+              duration, distance, steps, notes, created_at)
 ```
 
 `norm` is the normalized name — it carries the UNIQUE constraint, so the same
 exercise cannot arrive twice under different punctuation. Every measurement
-column is `TEXT` and defaults to `''`: a run has a duration and no reps, a
-lift has reps and no duration, and neither shape should have to pretend to be
-the other.
+column is `TEXT` and defaults to `''`: a run has a distance and no reps, a
+lift has reps and no distance, a Stairmaster has steps and none of the others,
+and no shape should have to pretend to be another.
+
+`distance` and `steps` were added after the first release, so startup runs an
+`ALTER TABLE … ADD COLUMN` for anything `PRAGMA table_info` says is missing.
+The volume is durable and holds real history; a new measurement field must
+never mean recreating the table. Rows written before a column existed simply
+read as `''`, which is what every optional field already means.
 
 `date` is a **local** `YYYY-MM-DD`, resolved through `WORKOUT_TIMEZONE`. The
 container runs UTC; storing a UTC date would file a 7pm workout under the
