@@ -139,9 +139,12 @@ had before those fields existed.
   one pace, the day's time over the day's distance. `show_workout_log` and the
   activity feed still show a per-entry pace on any entry that carries both.
 
-Numbers are parsed out of the free text only at read time — `"8, 8, 6"` is
-three sets' reps, `"185 lbs"` is 185, `"1h 10"` and `"22:30"` are minutes,
-`"2,000"` is 2000 steps. The stored text is always exactly what was said.
+All of it comes out of typed columns. The parsing of what was said —
+`"8, 8, 6"` into three sets' reps, `"185 lbs"` into 185 and `lbs`, `"1h 10"`
+and `"22:30"` into seconds, `"2,000"` into 2000 steps — happens **once, on the
+way in**, so every read above is a `SUM`/`MAX`/`AVG` over real numbers rather
+than a scan-and-regex. The spoken interface is unchanged: `log_exercise` still
+takes whatever comes naturally.
 
 Distance parsing is deliberately shallow: `"3.1 miles"` is miles, `"5k"`,
 `"5 km"` and `"400m"` are kilometres (metres divided down), and a bare number
@@ -150,25 +153,77 @@ first that day.
 
 ## Storage
 
-SQLite, in a Docker named volume so it survives a rebuild.
+SQLite, in a Docker named volume so it survives a rebuild. Three tables,
+following the three things that actually exist:
 
-```sql
-exercises    (id, name, norm UNIQUE, created_at)
-log_entries  (id, exercise_id, date, sets, reps, weight,
-              duration, distance, steps, notes, created_at)
+```
+exercises  ──<  entries  ──<  sets
 ```
 
-`norm` is the normalized name — it carries the UNIQUE constraint, so the same
-exercise cannot arrive twice under different punctuation. Every measurement
-column is `TEXT` and defaults to `''`: a run has a distance and no reps, a
-lift has reps and no distance, a Stairmaster has steps and none of the others,
-and no shape should have to pretend to be another.
+```sql
+exercises (id, name, norm UNIQUE, created_at)
 
-`distance` and `steps` were added after the first release, so startup runs an
-`ALTER TABLE … ADD COLUMN` for anything `PRAGMA table_info` says is missing.
-The volume is durable and holds real history; a new measurement field must
-never mean recreating the table. Rows written before a column existed simply
-read as `''`, which is what every optional field already means.
+entries   (id, exercise_id → exercises, date,
+           duration_seconds INTEGER, distance_value REAL, distance_unit TEXT,
+           steps INTEGER, notes, created_at)
+
+sets      (id, entry_id → entries, set_index,
+           reps INTEGER, weight_value REAL, weight_unit TEXT, weight_label,
+           UNIQUE (entry_id, set_index))
+```
+
+An **exercise** is a canonical movement. It has many **entries** — one per
+`log_exercise` call, which is one exercise on one day. A strength entry has
+many **sets**, and they are genuinely individual rows, because a working set is
+rarely uniform. *"10 @ 135, 8 @ 155, 6 @ 175"* is three different sets, and it
+is the per-set numbers that answer *what did the third set drop to* or *what
+was the real tonnage* — questions a comma-joined `"8, 8, 6"` string cannot:
+
+```sql
+-- Tonnage per session, which is the whole reason the sets table exists.
+SELECT e.date, SUM(s.reps * s.weight_value) AS volume
+  FROM sets s JOIN entries e ON e.id = s.entry_id
+ WHERE e.exercise_id = ? GROUP BY e.date ORDER BY e.date;
+```
+
+Some deliberate choices:
+
+- **Numbers are numbers, and units live beside them.** `"3.1 miles"` is
+  `distance_value 3.1` + `distance_unit 'mi'`, never one string. `SUM()` and
+  `AVG()` then just work. The first version of this stored all seven
+  measurements as free text on one row and re-parsed them with regexes on
+  every read — fine for reading a log back, useless for any question an
+  analyst would ask.
+- **Cardio measurements live on the entry, not in `sets`.** Duration, distance
+  and steps are one value for the whole effort; a run is not "sets of
+  running", and forcing it through the sets table would mean a fake set row
+  per run and a join to reach a single number. They are a true 1:1 with the
+  entry. The generic alternative — an `(entry, metric_name, value)` table —
+  would take the types back out of the database and make every read a pivot,
+  which is the mistake being fixed.
+- **No `kind` column.** Whether something is a lift or a run is not a fact to
+  be declared, it is visible from what was measured: an entry with set rows is
+  strength, one with a distance is cardio, and a weighted carry for time is
+  honestly both.
+- **NULL means not measured.** A bodyweight set has no weight, and that is not
+  zero. The `CHECK` constraints say a distance always carries its unit — never
+  that a distance must exist.
+- **`weight_label` is the one qualitative escape hatch**, for `"bodyweight"`,
+  `"band"`, `"bodyweight plus a 25"`. Weight is the measurement that is
+  routinely not a number, and free text in must never mean information lost.
+  Anything else unparseable — `"to failure"` in the reps field — joins the
+  entry's notes.
+- **Few indexes on purpose.** This is a personal log on a Pi. `entries(exercise_id,
+  date)` serves every progress read, `entries(date)` serves "what did I do
+  Tuesday", and `sets(entry_id, set_index)` comes free with the UNIQUE
+  constraint that stops a set being written twice at the same position. A
+  fourth would be a write cost paid for a scan that takes a millisecond.
+- **Foreign keys are switched on** at startup, outside the transaction
+  `executescript` opens — otherwise SQLite parses `ON DELETE CASCADE` and
+  silently ignores it, and every deleted entry would leave its sets behind.
+
+`norm` is the normalized name — it carries the UNIQUE constraint, so the same
+exercise cannot arrive twice under different punctuation.
 
 `date` is a **local** `YYYY-MM-DD`, resolved through `WORKOUT_TIMEZONE`. The
 container runs UTC; storing a UTC date would file a 7pm workout under the
@@ -177,6 +232,19 @@ following day.
 Deleting the last entry for an exercise deletes the exercise too — an empty
 canonical name is almost always a mishearing, and leaving it behind keeps it
 as a fuzzy-match target forever.
+
+### Migrating from the v1 free-text table
+
+The first release stored one `log_entries` row per call with `sets`, `reps`,
+`weight`, `duration`, `distance` and `steps` all as `TEXT`. Startup detects
+that table and migrates it in place, re-reading every row through the same
+parser a new log goes through — so `sets='3', reps='10', weight='140 lbs'`
+becomes three real set rows. Entry ids are preserved.
+
+The old table is **renamed to `log_entries_v1`, not dropped**. Parsing is lossy
+in exactly one direction: there is no way back from three set rows to the
+sentence that produced them. It costs a few kilobytes and it is the only record
+of what was actually said.
 
 ## Dashboard
 

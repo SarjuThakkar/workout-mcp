@@ -32,12 +32,12 @@ The bias is toward SPLITTING rather than merging. A duplicate exercise is
 announced in the reply and removed with one `delete_log_entry` call; a wrong
 merge quietly corrupts a history and is noticed months later, in a chart.
 
-EVERY FIELD IS FREE TEXT AND OPTIONAL. A run has a distance and a duration; a
-lift has sets, reps and weight; a Stairmaster has steps. Forcing any one shape
-onto the others loses information, so all seven are stored exactly as spoken
-and numbers are parsed out only when something needs to compare them
-(`show_progress`). That also means "3x8", "8, 8, 6", "185 lbs" and "5k" all
-survive intact.
+FREE TEXT IN, NUMBERS IN STORAGE. Every argument to `log_exercise` is still
+optional free text -- "3 sets of 10, 140 lbs", "8, 8, 6 at 135, 140, 145",
+"5k", "2000 steps" -- because that is what a ring transcribes and the spoken
+interface must not get harder to use. What changed is where the parsing
+happens: once, on the way in, into a normalized schema, rather than on every
+single read. See the Storage section for the shape and the reasoning.
 
 DELETE EXISTS FROM DAY ONE. Both of the MCPs built here before this one
 shipped without a delete tool and both left permanent test rows in real
@@ -98,6 +98,53 @@ class WorkoutError(Exception):
 # a lock: uvicorn serves this from a threadpool, and sqlite3 objects are not
 # safe to share across threads without `check_same_thread=False` plus external
 # serialization.
+#
+# THE SCHEMA, AND WHY IT IS SHAPED LIKE THIS
+#
+# Three tables, following the three things that actually exist:
+#
+#   exercises  --<  entries  --<  sets
+#
+# An EXERCISE is a canonical movement ("Bench Press"). It has many ENTRIES: one
+# per `log_exercise` call, which is one exercise on one day. A strength entry
+# has many SETS -- and they are genuinely individual, because a working set is
+# rarely uniform. "10 @ 135, 8 @ 155, 6 @ 175" is three different sets, and it
+# is the per-set numbers that answer "what did the third set drop to" or
+# "what was the real tonnage", questions a comma-joined "8, 8, 6" string
+# cannot.
+#
+# The first version of this stored all seven measurements as free text on one
+# row per call and re-parsed them with regexes on every read. That works for
+# reading a log back and stops dead at any question an analyst would ask.
+# So numbers are numbers here, and units live beside them in their own column
+# rather than inside the number ("3.1 miles" is `distance_value 3.1`,
+# `distance_unit 'mi'`) -- SUM() and AVG() then just work.
+#
+# CARDIO MEASUREMENTS LIVE ON THE ENTRY, NOT IN `sets`. Duration, distance and
+# steps are one value for the whole effort; a run is not "sets of running", and
+# forcing it through a sets table would mean one fake set row per run and a
+# join to reach a single number. They are nullable typed columns on `entries`,
+# which is a true 1:1 with the entry. The alternative -- a generic
+# (entry, metric_name, value) table -- would take types back out of the
+# database and make every read a pivot, which is the mistake being fixed.
+#
+# There is deliberately NO `kind` column on `entries`. Whether something is a
+# lift or a run is not a fact to be declared, it is visible from what was
+# measured: an entry with set rows is strength, one with a distance is cardio,
+# and something like a weighted carry for time is honestly both.
+#
+# NULL MEANS NOT MEASURED. A bodyweight set has no weight and that is not zero.
+# Every measurement column is nullable and every read treats NULL as absent --
+# which is also what makes the CHECK constraints below worth having: they say a
+# distance always carries its unit, never that a distance must exist.
+#
+# Indexes are deliberately few -- this is a personal log on a Pi, a few
+# thousand rows at the outside, and every index is a write cost paid for a scan
+# that would take a millisecond anyway. Two earn their place:
+# entries(exercise_id, date) for "this exercise over time", the query behind
+# every progress read, and entries(date) for "what did I do on Tuesday". The
+# third, sets(entry_id, set_index), comes free with the UNIQUE constraint that
+# keeps a set from being written twice at the same position.
 # ---------------------------------------------------------------------------
 
 _lock = threading.Lock()
@@ -105,62 +152,135 @@ Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.row_factory = sqlite3.Row
 
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS exercises (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    -- Normalized form of `name`, used for lookups and to stop the same
+    -- exercise arriving twice with different punctuation.
+    norm        TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL
+);
+
+-- One row per `log_exercise` call: one exercise, one day, one effort.
+CREATE TABLE IF NOT EXISTS entries (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    exercise_id      INTEGER NOT NULL REFERENCES exercises(id)
+                     ON DELETE CASCADE,
+    -- ISO YYYY-MM-DD in LOCAL time. The container runs UTC, so "today" is
+    -- always resolved through WORKOUT_TIMEZONE; storing a UTC date here would
+    -- put a 7pm workout on the wrong day.
+    date             TEXT NOT NULL,
+    -- Whole-effort measurements. NULL means not measured, never zero.
+    duration_seconds INTEGER,
+    distance_value   REAL,
+    distance_unit    TEXT,          -- 'mi' or 'km', as it was said
+    steps            INTEGER,
+    notes            TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    -- A measurement and its unit are one fact; neither is ever half-written.
+    CHECK ((distance_value IS NULL) = (distance_unit IS NULL)),
+    CHECK (duration_seconds IS NULL OR duration_seconds >= 0),
+    CHECK (distance_value   IS NULL OR distance_value   >= 0),
+    CHECK (steps            IS NULL OR steps            >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entries_exercise_date
+    ON entries(exercise_id, date);
+CREATE INDEX IF NOT EXISTS idx_entries_date
+    ON entries(date);
+
+-- One row per set actually performed. Three sets of ten is three rows, not a
+-- count: a pyramid is the normal case, not the exception.
+CREATE TABLE IF NOT EXISTS sets (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id     INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    set_index    INTEGER NOT NULL,   -- 1-based, the order they were done in
+    reps         INTEGER,
+    weight_value REAL,
+    weight_unit  TEXT,               -- 'lbs' or 'kg', as it was said
+    -- A weight that is not a number: "bodyweight", "band", "bodyweight plus a
+    -- 25". Free text in must never mean information lost, and this is the one
+    -- measurement that is routinely qualitative rather than numeric.
+    weight_label TEXT NOT NULL DEFAULT '',
+    UNIQUE (entry_id, set_index),
+    CHECK (set_index > 0),
+    CHECK ((weight_value IS NULL) = (weight_unit IS NULL)),
+    CHECK (reps         IS NULL OR reps         >= 0),
+    CHECK (weight_value IS NULL OR weight_value >= 0)
+);
+"""
+
 
 def _init_db() -> None:
     with _lock:
-        _db.executescript(
-            """
-            PRAGMA journal_mode=WAL;
+        # Both PRAGMAs run outside executescript: `foreign_keys` is a no-op
+        # inside a transaction, and executescript opens one. Without it SQLite
+        # parses ON DELETE CASCADE and then ignores it, which would leave a
+        # deleted entry's sets behind forever.
+        _db.execute("PRAGMA journal_mode=WAL")
+        _db.execute("PRAGMA foreign_keys=ON")
 
-            CREATE TABLE IF NOT EXISTS exercises (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                name       TEXT NOT NULL,
-                -- Normalized form of `name`, used for lookups and to stop the
-                -- same exercise arriving twice with different punctuation.
-                norm       TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL
-            );
+        tables = {r["name"] for r in _db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        legacy = "log_entries" in tables
+        if legacy:
+            # The v1 indexes squat on names the new ones want, and they belong
+            # to a table that is about to be retired anyway.
+            _db.executescript("DROP INDEX IF EXISTS idx_entries_date;"
+                              "DROP INDEX IF EXISTS idx_entries_exercise;")
+        _db.executescript(_SCHEMA)
 
-            CREATE TABLE IF NOT EXISTS log_entries (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                exercise_id INTEGER NOT NULL REFERENCES exercises(id)
-                            ON DELETE CASCADE,
-                -- ISO YYYY-MM-DD in LOCAL time. The container runs UTC, so
-                -- "today" is always resolved through WORKOUT_TIMEZONE; storing
-                -- a UTC date here would put a 7pm workout on the wrong day.
-                date        TEXT NOT NULL,
-                sets        TEXT NOT NULL DEFAULT '',
-                reps        TEXT NOT NULL DEFAULT '',
-                weight      TEXT NOT NULL DEFAULT '',
-                duration    TEXT NOT NULL DEFAULT '',
-                distance    TEXT NOT NULL DEFAULT '',
-                steps       TEXT NOT NULL DEFAULT '',
-                notes       TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_entries_date
-                ON log_entries(date);
-            CREATE INDEX IF NOT EXISTS idx_entries_exercise
-                ON log_entries(exercise_id, date);
-            """
-        )
-        # Columns added after the first release. The volume holding this
-        # database is durable and holds real history, so new measurement
-        # fields arrive by ALTER TABLE at startup rather than by recreating
-        # the table: an existing row keeps its data and simply gets '' for
-        # anything it never recorded, which is what every other optional
-        # field already means.
-        have = {r["name"] for r in _db.execute("PRAGMA table_info(log_entries)")}
-        for column in ("distance", "steps"):
-            if column not in have:
-                _db.execute(f"ALTER TABLE log_entries ADD COLUMN {column} "
-                            f"TEXT NOT NULL DEFAULT ''")
-                logger.info("migrated log_entries: added %s", column)
+        if legacy:
+            _migrate_v1()
         _db.commit()
 
 
-_init_db()
+def _migrate_v1() -> None:
+    """Carry the free-text `log_entries` table into entries + sets.
+
+    Runs once, in place, on the durable volume -- this database is the entire
+    workout history and there is no upstream copy of it anywhere.
+
+    Every old row is re-read through the same parser new logs go through, so a
+    row written as sets='3', reps='10', weight='140 lbs' lands as three real
+    set rows. Entry ids are preserved so anything that ever referred to one
+    still does.
+
+    The old table is renamed rather than dropped. Parsing is lossy in exactly
+    one direction -- there is no way back from 3 set rows to the sentence that
+    produced them -- so the original text stays on disk as a frozen snapshot.
+    It costs a few kilobytes and it is the only record of what was actually
+    said.
+    """
+    rows = _db.execute("SELECT * FROM log_entries ORDER BY id").fetchall()
+    have = {r["name"] for r in _db.execute("PRAGMA table_info(log_entries)")}
+
+    def old(row: sqlite3.Row, column: str) -> str:
+        return (row[column] or "").strip() if column in have else ""
+
+    for row in rows:
+        plan, leftover = _plan_sets(old(row, "sets"), old(row, "reps"),
+                                    old(row, "weight"))
+        notes = "; ".join(filter(None, (old(row, "notes"), leftover)))
+        dist = _distance(old(row, "distance"))
+        _db.execute(
+            "INSERT INTO entries (id, exercise_id, date, duration_seconds, "
+            "distance_value, distance_unit, steps, notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["id"], row["exercise_id"], row["date"],
+             _parse_seconds(old(row, "duration")),
+             dist[0] if dist else None, dist[1] if dist else None,
+             _parse_steps(old(row, "steps")), notes, row["created_at"]))
+        _db.executemany(
+            "INSERT INTO sets (entry_id, set_index, reps, weight_value, "
+            "weight_unit, weight_label) VALUES (?, ?, ?, ?, ?, ?)",
+            [(row["id"], i, *s) for i, s in enumerate(plan, 1)])
+        logger.info("migrated entry %s: %s set rows", row["id"], len(plan))
+
+    _db.execute("ALTER TABLE log_entries RENAME TO log_entries_v1")
+    logger.info("migrated %s entries to entries+sets; old table kept as "
+                "log_entries_v1", len(rows))
 
 
 def _query(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
@@ -173,6 +293,31 @@ def _write(sql: str, args: tuple = ()) -> int:
         cur = _db.execute(sql, args)
         _db.commit()
         return cur.lastrowid
+
+
+def _insert_entry(exercise_id: int, when: date, seconds: int | None,
+                  dist: tuple[float, str] | None, steps: int | None,
+                  notes: str, plan: list[tuple]) -> int:
+    """Write one entry and all of its sets as a single transaction.
+
+    Two `_write` calls would each commit, so a failure between them would leave
+    an entry with half its sets -- a wrong number that reads as a real one.
+    """
+    with _lock:
+        cur = _db.execute(
+            "INSERT INTO entries (exercise_id, date, duration_seconds, "
+            "distance_value, distance_unit, steps, notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (exercise_id, when.isoformat(), seconds,
+             dist[0] if dist else None, dist[1] if dist else None,
+             steps, notes, datetime.now(TZ).isoformat(timespec="seconds")))
+        entry_id = cur.lastrowid
+        _db.executemany(
+            "INSERT INTO sets (entry_id, set_index, reps, weight_value, "
+            "weight_unit, weight_label) VALUES (?, ?, ?, ?, ?, ?)",
+            [(entry_id, i, *s) for i, s in enumerate(plan, 1)])
+        _db.commit()
+        return entry_id
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +545,7 @@ def _find_exercise(spoken: str) -> sqlite3.Row | None:
     # every real -ordinal).
     recency = {r["exercise_id"]: -_iso(r["last"]).toordinal()
                for r in _query("SELECT exercise_id, MAX(date) AS last "
-                               "FROM log_entries GROUP BY exercise_id")}
+                               "FROM entries GROUP BY exercise_id")}
 
     said = key.split()
     said_set = set(said)
@@ -451,11 +596,14 @@ def _create_exercise(spoken: str) -> sqlite3.Row:
 
 
 # ---------------------------------------------------------------------------
-# Reading numbers back out of free text
+# Reading spoken text into numbers
 #
-# Storage keeps whatever was said. These are only for comparing sessions, and
-# every one of them can legitimately return None -- a bodyweight set has no
-# weight, and that is not an error.
+# These run ONCE, on the way in, and their output is what goes in the database.
+# The first version of this file ran them on every read instead, which is why
+# nothing downstream could aggregate.
+#
+# Every one of them can legitimately return None: a bodyweight set has no
+# weight, a run has no reps, and neither is an error.
 # ---------------------------------------------------------------------------
 
 def _num(text: str) -> float | None:
@@ -464,24 +612,13 @@ def _num(text: str) -> float | None:
     return float(m.group()) if m else None
 
 
-def _max_num(text: str) -> float | None:
-    """Largest number in the text. '8, 8, 6' -> 8.0; '135/155/185' -> 185.0."""
-    nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", text or "")]
-    return max(nums) if nums else None
+def _trim(value: float) -> str:
+    """A stored REAL as it would be said. 140.0 -> '140', 3.10 -> '3.1'."""
+    text = f"{value:,.2f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
-def _total_reps(row: sqlite3.Row) -> float | None:
-    """Rough total reps for a row: every rep number, or sets x reps."""
-    reps = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", row["reps"] or "")]
-    if not reps:
-        return None
-    if len(reps) > 1:
-        return sum(reps)
-    sets = _num(row["sets"])
-    return reps[0] * sets if sets else reps[0]
-
-
-def _steps(text: str) -> float | None:
+def _parse_steps(text: str) -> int | None:
     """Step count from free text. '2000', '2,000 steps', '1000 + 1000' -> 2000.
 
     Digit-grouping commas are stripped first: '2,000' would otherwise read as
@@ -489,7 +626,7 @@ def _steps(text: str) -> float | None:
     """
     raw = re.sub(r"(?<=\d),(?=\d\d\d)", "", (text or ""))
     nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", raw)]
-    return sum(nums) if nums else None
+    return int(round(sum(nums))) if nums else None
 
 
 # Only the units that actually get said out loud. Anything unrecognized falls
@@ -553,119 +690,333 @@ def _minutes(text: str) -> float | None:
     return bare  # "45" on its own is 45 minutes
 
 
-def _col(row: sqlite3.Row, name: str) -> str:
-    """A column that may predate a migration, as text.
+def _parse_seconds(text: str) -> int | None:
+    """A spoken duration as whole seconds, the way `entries` stores it.
 
-    The open connection is shared and long-lived; this keeps a row read before
-    a column existed from raising instead of reading as empty.
+    Seconds rather than minutes because an interval or a 400m split is said in
+    seconds and a float column would store 1.6666666666666667 minutes.
     """
-    try:
-        return (row[name] or "").strip()
-    except (IndexError, KeyError):
-        return ""
+    mins = _minutes(text)
+    return int(round(mins * 60)) if mins else None
 
 
-def _pace(row: sqlite3.Row) -> str:
+# A per-set list, however it gets said or transcribed: "8, 8, 6", "8/8/6",
+# "8 8 and 6".
+_SPLIT = re.compile(r"\s*(?:,|/|;|\+|\band\b)\s*")
+
+# Words that can appear in a reps field without meaning it is qualitative.
+_REP_WORDS = {"rep", "reps", "x", "each", "per", "set", "sets", "of"}
+
+_LB_UNITS = {"lb", "lbs", "pound", "pounds"}
+_KG_UNITS = {"kg", "kgs", "kilo", "kilos", "kilogram", "kilograms"}
+
+
+def _parse_reps(text: str) -> tuple[list[int], str]:
+    """Reps per set, plus any words that were not a number.
+
+    '10' -> ([10], ''), '8, 8, 6' -> ([8, 8, 6], ''), '10 reps' -> ([10], ''),
+    'to failure' -> ([], 'to failure'). A single value here is UNIFORM, not a
+    one-set entry: `_plan_sets` spreads it across however many sets there were.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return [], ""
+    words = [w for w in re.findall(r"[a-z]+", raw.lower())
+             if w not in _REP_WORDS]
+    out = []
+    for part in _SPLIT.split(raw):
+        value = _num(part)
+        if value is not None:
+            out.append(int(round(value)))
+    if not out:
+        # Nothing countable was said. Keep the words rather than dropping them;
+        # `log_exercise` folds them into the entry's notes.
+        return [], raw
+    if words:
+        logger.info("ignoring non-numeric reps text %r", " ".join(words))
+    return out, ""
+
+
+def _parse_weights(text: str) -> tuple[list[tuple[float, str]], str]:
+    """Weight per set as (value, unit), or a label when it is not a number.
+
+    '140 lbs' -> ([(140.0, 'lbs')], ''), '135, 155, 175' -> three entries in
+    lbs, '45 kg' -> kg, 'bodyweight' -> ([], 'bodyweight').
+
+    A weight is qualitative surprisingly often -- bodyweight, a band, "bodyweight
+    plus a 25" -- so any word that is not a unit means the whole field is a
+    label and no number is invented from it. One unit said anywhere applies to
+    the whole list, because "135, 155, 175 lbs" names the unit once.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return [], ""
+    words = re.findall(r"[a-z]+", raw.lower())
+    if any(w not in _LB_UNITS and w not in _KG_UNITS for w in words):
+        return [], raw
+
+    out: list[float] = []
+    unit = "lbs"
+    for part in _SPLIT.split(raw):
+        m = re.search(r"(\d+(?:\.\d+)?)\s*([a-z]*)", part.lower())
+        if not m:
+            continue
+        out.append(float(m.group(1)))
+        if m.group(2) in _KG_UNITS:
+            unit = "kg"
+    if not out:
+        return [], raw
+    return [(v, unit) for v in out], ""
+
+
+# A guard, not a rule anyone will meet: nobody does 51 sets, but a
+# mistranscribed "sets: 300" should not write 300 rows.
+_MAX_SETS = 50
+
+
+def _plan_sets(sets: str, reps: str, weight: str) -> tuple[list[tuple], str]:
+    """Turn what was said into one tuple per set, plus any leftover words.
+
+    This is the whole trick that keeps the spoken interface unchanged while the
+    storage underneath it is normalized. What gets said is some mixture of a
+    set COUNT and per-set LISTS, and either can be missing:
+
+        "3 sets of 10 at 140 lbs"        -> 3 identical sets
+        "8, 8, 6 at 135, 140, 145"       -> 3 different sets
+        "8, 8, 6 at 135"                 -> 3 sets, all at 135
+        "3 sets" (no reps)               -> 3 sets, reps unknown
+
+    So the number of sets is whichever is largest -- the count that was said,
+    or the longest list that was said -- and a list shorter than that repeats
+    its last value to fill. A single value repeating is the uniform case and
+    falls out of the same rule rather than needing its own.
+
+    Returns (rows, leftover) where each row is
+    (reps, weight_value, weight_unit, weight_label), matching the `sets`
+    table's insert order.
+    """
+    rep_list, rep_left = _parse_reps(reps)
+    weight_list, weight_label = _parse_weights(weight)
+    said = _num(sets)
+
+    count = max(int(said) if said else 0, len(rep_list), len(weight_list))
+    if count <= 0 and weight_label:
+        # "bodyweight" on its own is still one set that happened.
+        count = 1
+    if count <= 0:
+        return [], rep_left
+    if count > _MAX_SETS:
+        logger.info("clamping %s sets to %s", count, _MAX_SETS)
+        count = _MAX_SETS
+
+    def at(seq: list, i: int):
+        if not seq:
+            return None
+        return seq[i] if i < len(seq) else seq[-1]
+
+    rows = []
+    for i in range(count):
+        w = at(weight_list, i)
+        rows.append((at(rep_list, i),
+                     w[0] if w else None, w[1] if w else None, weight_label))
+    return rows, rep_left
+
+
+# ---------------------------------------------------------------------------
+# Saying stored numbers back out
+#
+# The mirror image of the parsers above. Storage is normalized, so a phrase is
+# rebuilt from the numbers rather than replayed from the text that was said --
+# which is how a pyramid set can now read back as its real per-set weights
+# instead of whatever single string got typed into the weight field.
+# ---------------------------------------------------------------------------
+
+def _say_distance(value: float, unit: str) -> str:
+    if unit == "km":
+        return f"{_trim(value)} km"
+    return f"{_trim(value)} mile" + ("" if value == 1 else "s")
+
+
+def _say_duration(seconds: int) -> str:
+    """Seconds as they would be said: '20 min', '22:30', '1h 10'."""
+    hours, rest = divmod(int(round(seconds)), 3600)
+    mins, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{mins:02d}:{secs:02d}" if secs else f"{hours}h {mins:02d}"
+    if secs:
+        return f"{mins}:{secs:02d}"
+    return f"{mins} min"
+
+
+def _pace(entry: dict) -> str:
     """Pace for one entry -- '8:45/mi' -- when it has both distance and time.
 
-    Only a row carrying both can have a pace; a distance with no duration and
-    a duration with no distance both correctly return nothing.
+    Only an entry carrying both can have a pace; a distance with no duration
+    and a duration with no distance both correctly return nothing.
     """
-    dist = _distance(_col(row, "distance"))
-    mins = _minutes(_col(row, "duration"))
-    if not dist or not mins:
+    value, unit = entry["distance_value"], entry["distance_unit"]
+    seconds = entry["duration_seconds"]
+    if not value or not seconds:
         return ""
-    value, unit = dist
-    return _fmt(mins / value, "pace", unit)
+    return _fmt((seconds / 60.0) / value, "pace", unit or "mi")
 
 
-def _describe(row: sqlite3.Row) -> str:
-    """One entry as a phrase: '3 sets of 8 at 185 lbs', '3.1 miles for 26:00
-    at 8:23/mi', '2,000 steps for 20 min'."""
-    sets, reps = (row["sets"] or "").strip(), (row["reps"] or "").strip()
-    weight, dur = (row["weight"] or "").strip(), (row["duration"] or "").strip()
-    distance, steps = _col(row, "distance"), _col(row, "steps")
-    notes = (row["notes"] or "").strip()
+def _load_entries(where: str = "", args: tuple = (),
+                  order: str = "ORDER BY e.date DESC, e.id DESC") -> list[dict]:
+    """Entries with their exercise name and their set rows attached.
 
+    Two queries rather than one join: a join to `sets` multiplies the entry
+    row, and every caller wants an entry with its sets nested, not a flattened
+    product it has to regroup.
+    """
+    rows = [dict(r) for r in _query(
+        f"SELECT e.*, x.name AS name FROM entries e "
+        f"JOIN exercises x ON x.id = e.exercise_id {where} {order}", args)]
+    if not rows:
+        return []
+    marks = ",".join("?" * len(rows))
+    by_entry: dict[int, list] = {}
+    for s in _query(f"SELECT * FROM sets WHERE entry_id IN ({marks}) "
+                    f"ORDER BY entry_id, set_index",
+                    tuple(r["id"] for r in rows)):
+        by_entry.setdefault(s["entry_id"], []).append(s)
+    for row in rows:
+        row["sets"] = by_entry.get(row["id"], [])
+    return rows
+
+
+def _describe(entry: dict) -> str:
+    """One entry as a phrase: '3 sets of 8 at 185 lbs', '3 sets of 10, 8, 6 at
+    135, 155, 175 lbs', '3.1 miles for 26 min at 8:23/mi', '2,000 steps for
+    20 min'."""
+    rows = entry["sets"]
     bits = []
-    if sets and reps:
-        bits.append(f"{sets} sets of {reps}")
-    elif sets:
-        bits.append(f"{sets} sets")
-    elif reps:
-        bits.append(f"{reps} reps")
-    # Same rule as weight below: only supply a unit when the caller gave a
-    # bare number, so "5k" and "2000 steps" are not restated with one.
-    if distance:
-        unit = "" if re.search(r"[a-z]", distance, re.I) else " miles"
-        bits.append(f"{distance}{unit}")
-    if steps:
-        unit = "" if re.search(r"[a-z]", steps, re.I) else " steps"
-        bits.append(f"{steps}{unit}")
-    if weight:
-        # "at bodyweight" reads better than "at bodyweight lbs"; only append a
-        # unit when the caller gave a bare number.
-        unit = "" if re.search(r"[a-z]", weight, re.I) else " lbs"
-        bits.append(f"at {weight}{unit}")
-    if dur:
-        bits.append(f"for {dur}")
-    pace = _pace(row)
+
+    if rows:
+        reps = [s["reps"] for s in rows if s["reps"] is not None]
+        if not reps:
+            if len(rows) > 1:
+                bits.append(f"{len(rows)} sets")
+        elif len(set(reps)) == 1 and len(reps) == len(rows):
+            bits.append(f"{len(rows)} sets of {reps[0]}" if len(rows) > 1
+                        else f"{reps[0]} reps")
+        else:
+            # A pyramid reads as its real per-set numbers, which is the point.
+            bits.append(f"{len(rows)} sets of "
+                        + ", ".join(str(r) for r in reps))
+
+    if entry["distance_value"]:
+        bits.append(_say_distance(entry["distance_value"],
+                                  entry["distance_unit"] or "mi"))
+    if entry["steps"]:
+        bits.append(f"{entry['steps']:,} steps")
+
+    weights = [(s["weight_value"], s["weight_unit"]) for s in rows
+               if s["weight_value"] is not None]
+    labels = [s["weight_label"] for s in rows if s["weight_label"]]
+    if weights:
+        unit = weights[0][1] or "lbs"
+        values = [v for v, _ in weights]
+        if len(set(values)) == 1 and len(values) == len(rows):
+            bits.append(f"at {_trim(values[0])} {unit}")
+        else:
+            bits.append("at " + ", ".join(_trim(v) for v in values)
+                        + f" {unit}")
+    elif labels:
+        # "at bodyweight" reads better than "at bodyweight lbs".
+        bits.append(f"at {labels[0]}")
+
+    if entry["duration_seconds"]:
+        bits.append(f"for {_say_duration(entry['duration_seconds'])}")
+    pace = _pace(entry)
     if pace:
         bits.append(f"at {pace}")
-    if notes:
-        bits.append(f"({notes})")
+    if (entry["notes"] or "").strip():
+        bits.append(f"({entry['notes'].strip()})")
     return " ".join(bits)
 
 
-def _entry_line(row: sqlite3.Row) -> str:
-    detail = _describe(row)
-    return f"{row['name']}{f' {detail}' if detail else ''}"
+def _entry_line(entry: dict) -> str:
+    detail = _describe(entry)
+    return f"{entry['name']}{f' {detail}' if detail else ''}"
+
+
+# Everything `_migrate_v1` reaches for now exists, so the database can be
+# opened. The call sits here rather than beside `_init_db` because migrating a
+# v1 row means re-reading its text through the same parsers a new log uses.
+_init_db()
 
 
 # ---------------------------------------------------------------------------
 # Progress
 # ---------------------------------------------------------------------------
 
+# Per-day totals, straight out of SQL. This is what the normalized schema
+# bought: COUNT/MAX/SUM over typed columns instead of a regex per row per read.
+#
+# The set aggregates are rolled up per entry in a subquery before the outer
+# GROUP BY, because joining `sets` directly would repeat each entry once per
+# set and make SUM(e.duration_seconds) count a 30-minute effort three times.
+_DAY_TOTALS = """
+    SELECT e.date                              AS date,
+           COALESCE(SUM(s.n_sets), 0)          AS sets,
+           MAX(s.top_weight)                   AS top_weight,
+           MAX(s.best_reps)                    AS best_reps,
+           COALESCE(SUM(s.total_reps), 0)      AS total_reps,
+           COALESCE(SUM(e.duration_seconds), 0) AS seconds,
+           COALESCE(SUM(e.steps), 0)           AS steps
+      FROM entries e
+      LEFT JOIN (SELECT entry_id,
+                        COUNT(*)          AS n_sets,
+                        MAX(weight_value) AS top_weight,
+                        MAX(reps)         AS best_reps,
+                        SUM(reps)         AS total_reps
+                   FROM sets GROUP BY entry_id) s ON s.entry_id = e.id
+     {where}
+     GROUP BY e.date
+"""
+
+
 def _sessions(exercise_id: int, since: date | None = None) -> list[dict]:
-    """Log rows collapsed into one entry per day, newest first.
+    """Entries collapsed into one session per day, newest first.
 
     A session is a date, not a row: three straight sets logged as three calls
     are one session, and comparing rows instead of days would report a trend
     from how the logging happened rather than from the training.
     """
-    sql = "SELECT * FROM log_entries WHERE exercise_id = ?"
+    where = "WHERE e.exercise_id = ?"
     args: tuple = (exercise_id,)
     if since:
-        sql += " AND date >= ?"
+        where += " AND e.date >= ?"
         args += (since.isoformat(),)
-    sql += " ORDER BY date DESC, id DESC"
+
+    rows = _load_entries(where, args)
+    if not rows:
+        return []
+    totals = {r["date"]: r for r in
+              _query(_DAY_TOTALS.format(where=where), args)}
 
     by_day: dict[str, dict] = {}
-    for row in _query(sql, args):
-        day = by_day.setdefault(row["date"], {
-            "date": row["date"], "rows": [], "top_weight": None,
-            "best_reps": None, "total_reps": 0.0, "minutes": 0.0, "sets": 0.0,
-            "steps": 0.0, "distance": 0.0, "distance_unit": None, "pace": None})
+    for row in rows:
+        day = by_day.get(row["date"])
+        if day is None:
+            t = totals[row["date"]]
+            day = by_day[row["date"]] = {
+                "date": row["date"], "rows": [],
+                "top_weight": t["top_weight"], "best_reps": t["best_reps"],
+                "total_reps": float(t["total_reps"] or 0),
+                "minutes": (t["seconds"] or 0) / 60.0,
+                "sets": float(t["sets"] or 0), "steps": float(t["steps"] or 0),
+                "distance": 0.0, "distance_unit": None, "pace": None}
         day["rows"].append(row)
-        w = _max_num(row["weight"])
-        if w is not None:
-            day["top_weight"] = w if day["top_weight"] is None else max(
-                day["top_weight"], w)
-        r = _max_num(row["reps"])
-        if r is not None:
-            day["best_reps"] = r if day["best_reps"] is None else max(
-                day["best_reps"], r)
-        day["total_reps"] += _total_reps(row) or 0.0
-        day["minutes"] += _minutes(row["duration"]) or 0.0
-        day["sets"] += _num(row["sets"]) or 0.0
-        day["steps"] += _steps(_col(row, "steps")) or 0.0
-        dist = _distance(_col(row, "distance"))
-        if dist:
-            value, unit = dist
-            # A day's distance is one number, so the first unit seen that day
-            # wins and anything else converts into it. Mixing miles and
-            # kilometres inside one session is vanishingly rare; silently
-            # adding 5 km to 3 miles would not be.
+
+        # Distance is the one total SQL cannot just SUM, because the unit is
+        # part of the value. A day's distance is one number, so the first unit
+        # seen that day wins and anything else converts into it: mixing miles
+        # and kilometres inside one session is vanishingly rare, silently
+        # adding 5 km to 3 miles would not be.
+        if row["distance_value"]:
+            value, unit = row["distance_value"], row["distance_unit"] or "mi"
             if day["distance_unit"] is None:
                 day["distance_unit"] = unit
             elif unit != day["distance_unit"]:
@@ -823,17 +1174,20 @@ def log_exercise(exercise: str, sets: str = "", reps: str = "",
         logger.error("log_exercise failed: %s", err)
         return "I couldn't save that -- the workout database wouldn't take it."
 
-    entry_id = _write(
-        "INSERT INTO log_entries (exercise_id, date, sets, reps, weight, "
-        "duration, distance, steps, notes, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (row["id"], when.isoformat(), sets.strip(), reps.strip(),
-         weight.strip(), duration.strip(), distance.strip(), steps.strip(),
-         notes.strip(), datetime.now(TZ).isoformat(timespec="seconds")))
+    # All the parsing happens here, once. Everything downstream reads numbers.
+    try:
+        plan, leftover = _plan_sets(sets, reps, weight)
+        entry_id = _insert_entry(
+            row["id"], when, _parse_seconds(duration), _distance(distance),
+            _parse_steps(steps),
+            # Words that were said but are not a measurement -- "to failure" in
+            # the reps field -- join the notes rather than being dropped.
+            "; ".join(filter(None, (notes.strip(), leftover))), plan)
+    except sqlite3.Error as err:
+        logger.error("log_exercise insert failed: %s", err)
+        return "I couldn't save that -- the workout database wouldn't take it."
 
-    saved = _query("SELECT e.*, x.name FROM log_entries e "
-                   "JOIN exercises x ON x.id = e.exercise_id "
-                   "WHERE e.id = ?", (entry_id,))[0]
+    saved = _load_entries("WHERE e.id = ?", (entry_id,))[0]
     detail = _describe(saved)
     when_str = "" if when == _today() else f" for {_say_date(when)}"
 
@@ -860,7 +1214,7 @@ def list_exercises() -> str:
     logger.info("list_exercises")
     rows = _query(
         "SELECT x.name, COUNT(e.id) AS n, MAX(e.date) AS last "
-        "FROM exercises x LEFT JOIN log_entries e ON e.exercise_id = x.id "
+        "FROM exercises x LEFT JOIN entries e ON e.exercise_id = x.id "
         "GROUP BY x.id ORDER BY last IS NULL, last DESC, x.name COLLATE NOCASE")
     if not rows:
         return ("No exercises tracked yet -- log one and it'll start the "
@@ -967,10 +1321,8 @@ def show_workout_log(date: str = "") -> str:
         return str(err)
 
     if one_day:
-        rows = _query(
-            "SELECT e.*, x.name FROM log_entries e "
-            "JOIN exercises x ON x.id = e.exercise_id "
-            "WHERE e.date = ? ORDER BY e.id", (when.isoformat(),))
+        rows = _load_entries("WHERE e.date = ?", (when.isoformat(),),
+                             "ORDER BY e.id")
         if not rows:
             return f"Nothing logged {_say_date(when)}."
         # Lead with the summary, then itemize -- same shape as loseit-mcp's
@@ -982,14 +1334,12 @@ def show_workout_log(date: str = "") -> str:
         return f"{head}. " + ". ".join(_entry_line(r) for r in rows) + "."
 
     since = _today() - timedelta(days=6)
-    rows = _query(
-        "SELECT e.*, x.name FROM log_entries e "
-        "JOIN exercises x ON x.id = e.exercise_id "
-        "WHERE e.date >= ? ORDER BY e.date DESC, e.id", (since.isoformat(),))
+    rows = _load_entries("WHERE e.date >= ?", (since.isoformat(),),
+                         "ORDER BY e.date DESC, e.id")
     if not rows:
         return "Nothing logged in the last week."
 
-    by_day: dict[str, list[sqlite3.Row]] = {}
+    by_day: dict[str, list[dict]] = {}
     for r in rows:
         by_day.setdefault(r["date"], []).append(r)
     days = len(by_day)
@@ -1024,10 +1374,7 @@ def delete_log_entry(description: str) -> str:
         return "Tell me which entry to delete."
 
     since = (_today() - timedelta(days=30)).isoformat()
-    rows = _query(
-        "SELECT e.*, x.name FROM log_entries e "
-        "JOIN exercises x ON x.id = e.exercise_id "
-        "WHERE e.date >= ? ORDER BY e.date DESC, e.id DESC", (since,))
+    rows = _load_entries("WHERE e.date >= ?", (since,))
     if not rows:
         return "There's nothing logged in the last 30 days to delete."
 
@@ -1096,14 +1443,16 @@ def delete_log_entry(description: str) -> str:
                 f"Which one?")
 
     row = tied[0]
-    _write("DELETE FROM log_entries WHERE id = ?", (row["id"],))
+    # The entry's set rows go with it, via ON DELETE CASCADE -- which only
+    # fires because `_init_db` turns foreign keys on.
+    _write("DELETE FROM entries WHERE id = ?", (row["id"],))
     line = _entry_line(row)
     when = _say_date(_iso(row["date"]))
 
     # An exercise with no entries left is a canonical name that only exists
     # because of the entry just removed -- usually a mistyped or misheard one.
     # Leaving it behind would keep offering it as a fuzzy-match target forever.
-    left = _query("SELECT COUNT(*) AS n FROM log_entries WHERE exercise_id = ?",
+    left = _query("SELECT COUNT(*) AS n FROM entries WHERE exercise_id = ?",
                   (row["exercise_id"],))[0]["n"]
     also = ""
     if left == 0:
@@ -1151,7 +1500,7 @@ async def index(request: Request) -> Response:
 async def api_exercises(request: Request) -> JSONResponse:
     rows = _query(
         "SELECT x.id, x.name, COUNT(e.id) AS entries, MAX(e.date) AS last "
-        "FROM exercises x LEFT JOIN log_entries e ON e.exercise_id = x.id "
+        "FROM exercises x LEFT JOIN entries e ON e.exercise_id = x.id "
         "GROUP BY x.id ORDER BY last IS NULL, last DESC, x.name COLLATE NOCASE")
     out = []
     for r in rows:
@@ -1178,10 +1527,7 @@ async def api_log(request: Request) -> JSONResponse:
     except ValueError:
         days = 14
     since = (_today() - timedelta(days=days - 1)).isoformat()
-    rows = _query(
-        "SELECT e.*, x.name FROM log_entries e "
-        "JOIN exercises x ON x.id = e.exercise_id "
-        "WHERE e.date >= ? ORDER BY e.date DESC, e.id DESC", (since,))
+    rows = _load_entries("WHERE e.date >= ?", (since,))
     by_day: dict[str, list[dict]] = {}
     for r in rows:
         by_day.setdefault(r["date"], []).append(
