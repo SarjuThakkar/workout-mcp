@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0d1117">
+<title>Workouts</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #14181f;
+    --muted: #6b7480;
+    --line: #e3e6ea;
+    --accent: #2f6df6;
+    --up: #16794a;
+    --down: #b4472c;
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --card: #161b22;
+      --ink: #e8edf3;
+      --muted: #8b949e;
+      --line: #262c36;
+      --accent: #5b8cff;
+      --up: #4ec98a;
+      --down: #ef7f60;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+    padding: max(12px, env(safe-area-inset-top)) 12px
+             max(24px, env(safe-area-inset-bottom));
+    max-width: 620px;
+    margin-inline: auto;
+  }
+  header { padding: 6px 4px 14px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 3px; }
+
+  nav {
+    display: flex; gap: 6px; margin-bottom: 14px;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 999px; padding: 4px;
+  }
+  nav button {
+    flex: 1; appearance: none; border: 0; background: none; cursor: pointer;
+    color: var(--muted); font: inherit; font-weight: 600; font-size: 14px;
+    padding: 8px 10px; border-radius: 999px;
+  }
+  nav button[aria-selected="true"] { background: var(--accent); color: #fff; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); margin-bottom: 10px; overflow: hidden;
+  }
+  .row {
+    display: flex; align-items: baseline; gap: 10px; width: 100%;
+    padding: 13px 14px; text-align: left;
+    appearance: none; border: 0; background: none; color: inherit;
+    font: inherit; cursor: pointer;
+  }
+  .row .name { font-weight: 650; letter-spacing: -0.01em; flex: 1; min-width: 0; }
+  .row .meta { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .chev { color: var(--muted); font-size: 12px; transition: transform .15s; }
+  .row[aria-expanded="true"] .chev { transform: rotate(90deg); }
+
+  .stats {
+    display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 12px;
+  }
+  .pill {
+    font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+  }
+  .pill.up   { background: color-mix(in srgb, var(--up) 15%, transparent);
+               color: var(--up); }
+  .pill.down { background: color-mix(in srgb, var(--down) 15%, transparent);
+               color: var(--down); }
+  .pill.flat { background: color-mix(in srgb, var(--muted) 15%, transparent);
+               color: var(--muted); }
+
+  .detail { border-top: 1px solid var(--line); padding: 12px 14px 14px; }
+  .chartwrap { height: 150px; margin-bottom: 12px; }
+  ul.hist { list-style: none; margin: 0; padding: 0; }
+  ul.hist li {
+    display: flex; gap: 10px; padding: 7px 0;
+    border-top: 1px solid var(--line); font-size: 13.5px;
+  }
+  ul.hist li:first-child { border-top: 0; }
+  ul.hist .when { color: var(--muted); flex: 0 0 84px; }
+  ul.hist .what { flex: 1; }
+
+  .dayhead {
+    font-size: 12px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--muted); padding: 12px 14px 0;
+  }
+  .empty {
+    text-align: center; color: var(--muted); padding: 44px 20px; font-size: 14px;
+  }
+  .empty code {
+    display: block; margin-top: 10px; color: var(--ink); font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Workouts</h1>
+  <div class="sub" id="sub">Loading…</div>
+</header>
+
+<nav>
+  <button id="tab-ex" aria-selected="true">Exercises</button>
+  <button id="tab-log" aria-selected="false">Recent</button>
+</nav>
+
+<main id="view"></main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var view = document.getElementById("view");
+  var sub = document.getElementById("sub");
+  var tabEx = document.getElementById("tab-ex");
+  var tabLog = document.getElementById("tab-log");
+  var data = { exercises: [], today: null };
+  var logDays = [];
+  var open = {};        // exercise id -> expanded
+  var charts = {};      // exercise id -> Chart instance
+  var tab = "ex";
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;",
+               '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // The API sends plain YYYY-MM-DD, which `new Date()` parses as UTC and then
+  // renders in local time -- one day early for anyone west of Greenwich. Build
+  // the date from its parts so a workout never drifts to the previous day.
+  function parseDay(iso) {
+    var p = String(iso).split("-");
+    return new Date(+p[0], +p[1] - 1, +p[2]);
+  }
+
+  function sayDay(iso) {
+    if (!iso) return "never";
+    var d = parseDay(iso), today = parseDay(data.today);
+    var days = Math.round((today - d) / 86400000);
+    if (days === 0) return "today";
+    if (days === 1) return "yesterday";
+    if (days < 7) return d.toLocaleDateString(undefined, { weekday: "long" });
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
+  function fmt(v, metric) {
+    if (v == null) return "";
+    if (metric === "minutes") return Math.round(v) + " min";
+    var n = Math.round(v * 10) / 10;
+    return metric === "top_weight" ? n + " lbs" : String(n);
+  }
+
+  function trendClass(t) {
+    if (t === "trending up") return "up";
+    if (t === "trending down") return "down";
+    return "flat";
+  }
+
+  function renderExercises() {
+    if (!data.exercises.length) {
+      view.innerHTML = '<div class="empty">Nothing logged yet.' +
+        '<code>Say "log bench press, 3 sets of 8 at 185"</code></div>';
+      return;
+    }
+    var html = "";
+    data.exercises.forEach(function (ex) {
+      var expanded = !!open[ex.id];
+      var meta = ex.sessions + (ex.sessions === 1 ? " session" : " sessions") +
+                 " · " + sayDay(ex.last);
+      html += '<section class="card">' +
+        '<button class="row" data-id="' + ex.id + '" aria-expanded="' +
+          expanded + '">' +
+          '<span class="name">' + esc(ex.name) + '</span>' +
+          '<span class="meta">' + esc(meta) + '</span>' +
+          '<span class="chev">&#9656;</span>' +
+        '</button>';
+
+      var pills = "";
+      if (ex.best != null) {
+        pills += '<span class="pill">Best ' + esc(fmt(ex.best, ex.metric)) +
+                 '</span>';
+      }
+      if (ex.trend) {
+        pills += '<span class="pill ' + trendClass(ex.trend) + '">' +
+                 esc(ex.trend) + '</span>';
+      }
+      if (pills) html += '<div class="stats">' + pills + '</div>';
+
+      if (expanded) {
+        html += '<div class="detail">';
+        if (ex.history.filter(function (h) { return h[ex.metric] != null; })
+              .length >= 2) {
+          html += '<div class="chartwrap"><canvas id="c' + ex.id +
+                  '"></canvas></div>';
+        }
+        html += '<ul class="hist">';
+        ex.history.slice(0, 12).forEach(function (h) {
+          html += '<li><span class="when">' + esc(sayDay(h.date)) +
+                  '</span><span class="what">' +
+                  esc(h.detail || "logged") + '</span></li>';
+        });
+        html += "</ul></div>";
+      }
+      html += "</section>";
+    });
+    view.innerHTML = html;
+
+    data.exercises.forEach(function (ex) {
+      if (open[ex.id]) drawChart(ex);
+    });
+  }
+
+  function drawChart(ex) {
+    var canvas = document.getElementById("c" + ex.id);
+    if (!canvas || typeof Chart === "undefined") return;
+    var points = ex.history
+      .filter(function (h) { return h[ex.metric] != null; })
+      .slice(0, 12)
+      .reverse();                         // API is newest-first; a chart is not
+    if (points.length < 2) return;
+
+    var style = getComputedStyle(document.body);
+    var accent = style.getPropertyValue("--accent").trim() || "#2f6df6";
+    var muted = style.getPropertyValue("--muted").trim() || "#6b7480";
+    var line = style.getPropertyValue("--line").trim() || "#e3e6ea";
+
+    if (charts[ex.id]) charts[ex.id].destroy();
+    charts[ex.id] = new Chart(canvas.getContext("2d"), {
+      type: "line",
+      data: {
+        labels: points.map(function (p) { return sayDay(p.date); }),
+        datasets: [{
+          data: points.map(function (p) { return p[ex.metric]; }),
+          borderColor: accent,
+          backgroundColor: accent,
+          borderWidth: 2,
+          pointRadius: 3,
+          tension: 0.25,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: function (c) { return fmt(c.parsed.y, ex.metric); }
+            }
+          }
+        },
+        scales: {
+          x: { ticks: { color: muted, font: { size: 10 }, maxRotation: 0,
+                        autoSkipPadding: 12 },
+               grid: { display: false } },
+          y: { ticks: { color: muted, font: { size: 10 } },
+               grid: { color: line }, beginAtZero: false }
+        }
+      }
+    });
+  }
+
+  function renderLog() {
+    if (!logDays.length) {
+      view.innerHTML = '<div class="empty">Nothing logged in the last two ' +
+                       'weeks.</div>';
+      return;
+    }
+    var html = "";
+    logDays.forEach(function (day) {
+      html += '<section class="card"><div class="dayhead">' +
+              esc(sayDay(day.date)) + '</div><ul class="hist" ' +
+              'style="padding:6px 14px 12px">';
+      day.entries.forEach(function (e) {
+        html += '<li><span class="what"><strong>' + esc(e.name) +
+                '</strong>' + (e.detail ? " " + esc(e.detail) : "") +
+                '</span></li>';
+      });
+      html += "</ul></section>";
+    });
+    view.innerHTML = html;
+  }
+
+  function render() {
+    tabEx.setAttribute("aria-selected", tab === "ex");
+    tabLog.setAttribute("aria-selected", tab === "log");
+    if (tab === "ex") renderExercises(); else renderLog();
+  }
+
+  view.addEventListener("click", function (ev) {
+    var row = ev.target.closest(".row");
+    if (!row) return;
+    var id = +row.dataset.id;
+    open[id] = !open[id];
+    renderExercises();
+  });
+
+  tabEx.addEventListener("click", function () { tab = "ex"; render(); });
+  tabLog.addEventListener("click", function () { tab = "log"; render(); });
+
+  // Resolved against location.origin rather than passed as a relative path.
+  // A relative URL resolves against the document's own URL, and if that URL
+  // carries Basic Auth credentials -- "https://user:pass@host/", which is a
+  // realistic way to bookmark this and skip the browser's auth dialog --
+  // fetch() refuses outright with "Request cannot be constructed from a URL
+  // that includes credentials". location.origin is scheme://host:port only,
+  // so it never carries them.
+  function get(path) {
+    return fetch(new URL(path, location.origin).href, {
+      credentials: "same-origin"
+    }).then(function (r) {
+      if (!r.ok) throw new Error(r.status + " " + r.statusText);
+      return r.json();
+    });
+  }
+
+  Promise.all([get("/api/exercises"), get("/api/log?days=14")])
+    .then(function (res) {
+      data = res[0];
+      logDays = res[1].days || [];
+      var n = data.exercises.length;
+      var entries = data.exercises.reduce(function (a, e) {
+        return a + e.entries;
+      }, 0);
+      sub.textContent = n
+        ? n + (n === 1 ? " exercise" : " exercises") + " · " + entries +
+          (entries === 1 ? " entry logged" : " entries logged")
+        : "Nothing logged yet";
+      render();
+    })
+    .catch(function (err) {
+      sub.textContent = "Couldn't load";
+      view.innerHTML = '<div class="empty">' + esc(err.message) + '</div>';
+    });
+})();
+</script>
+</body>
+</html>

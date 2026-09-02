@@ -1,0 +1,6 @@
+# Pinned to the same set loseit-mcp resolved on 2026-09-01 and has run on
+# since. Unpinned installs have broken other services on this box before --
+# don't "helpfully" unpin.
+fastmcp==3.4.7
+uvicorn==0.52.4
+starlette==1.6.0
