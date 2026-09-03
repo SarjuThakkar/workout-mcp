@@ -88,6 +88,14 @@
                color: var(--down); }
   .pill.flat { background: color-mix(in srgb, var(--muted) 15%, transparent);
                color: var(--muted); }
+  button.pill {
+    appearance: none; border: 0; font: inherit; font-size: 12px;
+    font-weight: 600; cursor: pointer;
+    background: color-mix(in srgb, var(--muted) 15%, transparent);
+    color: var(--muted);
+  }
+  button.pill[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .modes { display: flex; gap: 6px; margin-bottom: 10px; }
 
   .detail { border-top: 1px solid var(--line); padding: 12px 14px 14px; }
   .chartwrap { height: 150px; margin-bottom: 12px; }
@@ -137,6 +145,7 @@
   var data = { exercises: [], today: null };
   var logDays = [];
   var open = {};        // exercise id -> expanded
+  var volume = {};      // exercise id -> chart showing volume instead of max
   var charts = {};      // exercise id -> Chart instance
   var tab = "ex";
 
@@ -182,7 +191,21 @@
       return (Math.round(v * 100) / 100) + " " + unit;
     }
     var n = Math.round(v * 10) / 10;
-    return metric === "top_weight" ? n + " lbs" : String(n);
+    if (metric === "top_weight" || metric === "volume") {
+      return n.toLocaleString() + " lbs";
+    }
+    return String(n);
+  }
+
+  // Volume is offered as a second view of a lift, never as its headline
+  // number: ex.metric still decides the pills, the best, and the trend.
+  function chartKey(ex) {
+    return volume[ex.id] && ex.metric === "top_weight" ? "volume" : ex.metric;
+  }
+
+  function plottable(ex, key) {
+    return ex.history.filter(function (h) { return h[key] != null; })
+             .length >= 2;
   }
 
   function trendClass(t) {
@@ -223,8 +246,17 @@
 
       if (expanded) {
         html += '<div class="detail">';
-        if (ex.history.filter(function (h) { return h[ex.metric] != null; })
-              .length >= 2) {
+        var key = chartKey(ex);
+        if (ex.metric === "top_weight" &&
+            (plottable(ex, "top_weight") || plottable(ex, "volume"))) {
+          html += '<div class="modes">' +
+            '<button class="pill mode" data-id="' + ex.id + '" data-vol="0"' +
+              ' aria-pressed="' + (key !== "volume") + '">Max</button>' +
+            '<button class="pill mode" data-id="' + ex.id + '" data-vol="1"' +
+              ' aria-pressed="' + (key === "volume") + '">Volume</button>' +
+            '</div>';
+        }
+        if (plottable(ex, key)) {
           html += '<div class="chartwrap"><canvas id="c' + ex.id +
                   '"></canvas></div>';
         }
@@ -248,8 +280,9 @@
   function drawChart(ex) {
     var canvas = document.getElementById("c" + ex.id);
     if (!canvas || typeof Chart === "undefined") return;
+    var key = chartKey(ex);
     var points = ex.history
-      .filter(function (h) { return h[ex.metric] != null; })
+      .filter(function (h) { return h[key] != null; })
       .slice(0, 12)
       .reverse();                         // API is newest-first; a chart is not
     if (points.length < 2) return;
@@ -260,11 +293,12 @@
     var line = style.getPropertyValue("--line").trim() || "#e3e6ea";
 
     // A pace is minutes as a decimal -- 8.38 on an axis is unreadable, so
-    // those ticks get the mm:ss treatment. Every other metric keeps Chart.js's
-    // own tick labels, so no existing chart changes.
+    // those ticks get the mm:ss treatment, and volume runs into the thousands
+    // so it gets separators. Every other metric keeps Chart.js's own tick
+    // labels, so no existing chart changes.
     var yTicks = { color: muted, font: { size: 10 } };
-    if (ex.metric === "pace") {
-      yTicks.callback = function (v) { return fmt(v, "pace", ex.metric_unit); };
+    if (key === "pace" || key === "volume") {
+      yTicks.callback = function (v) { return fmt(v, key, ex.metric_unit); };
     }
 
     if (charts[ex.id]) charts[ex.id].destroy();
@@ -273,7 +307,7 @@
       data: {
         labels: points.map(function (p) { return sayDay(p.date); }),
         datasets: [{
-          data: points.map(function (p) { return p[ex.metric]; }),
+          data: points.map(function (p) { return p[key]; }),
           borderColor: accent,
           backgroundColor: accent,
           borderWidth: 2,
@@ -291,7 +325,7 @@
           tooltip: {
             callbacks: {
               label: function (c) {
-                return fmt(c.parsed.y, ex.metric, ex.metric_unit);
+                return fmt(c.parsed.y, key, ex.metric_unit);
               }
             }
           }
@@ -334,6 +368,12 @@
   }
 
   view.addEventListener("click", function (ev) {
+    var mode = ev.target.closest("button.mode");
+    if (mode) {
+      volume[+mode.dataset.id] = mode.dataset.vol === "1";
+      renderExercises();
+      return;
+    }
     var row = ev.target.closest(".row");
     if (!row) return;
     var id = +row.dataset.id;

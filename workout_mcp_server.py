@@ -963,6 +963,7 @@ _DAY_TOTALS = """
            MAX(s.top_weight)                   AS top_weight,
            MAX(s.best_reps)                    AS best_reps,
            COALESCE(SUM(s.total_reps), 0)      AS total_reps,
+           COALESCE(SUM(s.volume), 0)          AS volume,
            COALESCE(SUM(e.duration_seconds), 0) AS seconds,
            COALESCE(SUM(e.steps), 0)           AS steps
       FROM entries e
@@ -970,7 +971,8 @@ _DAY_TOTALS = """
                         COUNT(*)          AS n_sets,
                         MAX(weight_value) AS top_weight,
                         MAX(reps)         AS best_reps,
-                        SUM(reps)         AS total_reps
+                        SUM(reps)         AS total_reps,
+                        COALESCE(SUM(reps * weight_value), 0) AS volume
                    FROM sets GROUP BY entry_id) s ON s.entry_id = e.id
      {where}
      GROUP BY e.date
@@ -1005,6 +1007,7 @@ def _sessions(exercise_id: int, since: date | None = None) -> list[dict]:
                 "date": row["date"], "rows": [],
                 "top_weight": t["top_weight"], "best_reps": t["best_reps"],
                 "total_reps": float(t["total_reps"] or 0),
+                "volume": float(t["volume"] or 0),
                 "minutes": (t["seconds"] or 0) / 60.0,
                 "sets": float(t["sets"] or 0), "steps": float(t["steps"] or 0),
                 "distance": 0.0, "distance_unit": None, "pace": None}
@@ -1478,6 +1481,7 @@ def _session_payload(exercise_id: int, limit: int = 30) -> list[dict]:
             "top_weight": s["top_weight"],
             "best_reps": s["best_reps"],
             "total_reps": s["total_reps"] or None,
+            "volume": round(s["volume"], 1) or None,
             "minutes": round(s["minutes"], 1) or None,
             "sets": s["sets"] or None,
             "steps": s["steps"] or None,
