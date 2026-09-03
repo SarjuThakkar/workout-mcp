@@ -30,7 +30,8 @@ and mistranscription.
 
 The bias is toward SPLITTING rather than merging. A duplicate exercise is
 announced in the reply and removed with one `delete_log_entry` call; a wrong
-merge quietly corrupts a history and is noticed months later, in a chart.
+merge quietly corrupts a history and is noticed months later, in a chart --
+`edit_log_entry` is how one gets moved back off the exercise it landed on.
 
 FREE TEXT IN, NUMBERS IN STORAGE. Every argument to `log_exercise` is still
 optional free text -- "3 sets of 10, 140 lbs", "8, 8, 6 at 135, 140, 145",
@@ -42,7 +43,9 @@ single read. See the Storage section for the shape and the reasoning.
 DELETE EXISTS FROM DAY ONE. Both of the MCPs built here before this one
 shipped without a delete tool and both left permanent test rows in real
 accounts, because there was no way to clean up after verifying. `delete_log_entry`
-is here so verification is reversible.
+is here so verification is reversible. `edit_log_entry` covers the other half:
+the entry belongs, one of its fields is wrong. It reassigns an exercise on an
+exact name only, never a fuzzy one -- see the comment in it.
 
 Every optional argument is a plain `str = ""`, never `str | None`. Strict
 function-calling validators reject the `anyOf: [string, null]` schema that
@@ -318,6 +321,37 @@ def _insert_entry(exercise_id: int, when: date, seconds: int | None,
             [(entry_id, i, *s) for i, s in enumerate(plan, 1)])
         _db.commit()
         return entry_id
+
+
+def _update_entry(entry_id: int, fields: dict, plan: list[tuple] | None) -> None:
+    """Apply one edit -- changed columns, and a full replacement of the set
+    rows when `plan` is given -- as a single transaction.
+
+    Same reasoning as `_insert_entry`, one step worse: replacing sets is a
+    DELETE followed by an INSERT, so a commit between them would leave an entry
+    with no sets at all if the insert failed. The rollback matters for the same
+    reason -- a half-applied edit left open would otherwise be committed by
+    whatever wrote next.
+    """
+    with _lock:
+        try:
+            if fields:
+                assign = ", ".join(f"{column} = ?" for column in fields)
+                _db.execute(f"UPDATE entries SET {assign} WHERE id = ?",
+                            (*fields.values(), entry_id))
+            if plan is not None:
+                # Old rows go before new ones arrive: UNIQUE(entry_id,
+                # set_index) makes writing set 1 twice an error, not an update.
+                _db.execute("DELETE FROM sets WHERE entry_id = ?", (entry_id,))
+                _db.executemany(
+                    "INSERT INTO sets (entry_id, set_index, reps, "
+                    "weight_value, weight_unit, weight_label) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [(entry_id, i, *s) for i, s in enumerate(plan, 1)])
+            _db.commit()
+        except sqlite3.Error:
+            _db.rollback()
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +856,31 @@ def _plan_sets(sets: str, reps: str, weight: str) -> tuple[list[tuple], str]:
     return rows, rep_left
 
 
+def _seed_sets(rows: list[sqlite3.Row]) -> tuple[str, str, str]:
+    """An entry's stored sets, back in the free text `_plan_sets` reads.
+
+    Editing any one of sets/reps/weight replaces all of an entry's set rows, so
+    the other two have to come from somewhere: they come from what is already
+    stored, rendered back into the words a caller would have said. That is what
+    makes "just fix the weight to 145" keep the rep count instead of wiping it.
+    """
+    if not rows:
+        return "", "", ""
+    reps = [str(r["reps"]) for r in rows if r["reps"] is not None]
+    weights = [(r["weight_value"], r["weight_unit"]) for r in rows
+               if r["weight_value"] is not None]
+    label = next((r["weight_label"] for r in rows if r["weight_label"]), "")
+    if weights:
+        # `_trim` groups thousands, and a comma is how a per-set list is
+        # written -- so "1,000" would read back as two sets. No weight anyone
+        # lifts reaches it, but the seed must survive its own parser.
+        said = ", ".join(_trim(v).replace(",", "") for v, _ in weights)
+        weight = f"{said} {weights[0][1] or 'lbs'}"
+    else:
+        weight = label
+    return str(len(rows)), ", ".join(reps), weight
+
+
 # ---------------------------------------------------------------------------
 # Saying stored numbers back out
 #
@@ -939,6 +998,98 @@ def _describe(entry: dict) -> str:
 def _entry_line(entry: dict) -> str:
     detail = _describe(entry)
     return f"{entry['name']}{f' {detail}' if detail else ''}"
+
+
+# ---------------------------------------------------------------------------
+# Finding one already-logged entry
+#
+# Shared by `delete_log_entry` and `edit_log_entry`: both are given a spoken
+# phrase for something already in the log, and both do real damage if they act
+# on the wrong row, so they resolve it exactly the same way.
+# ---------------------------------------------------------------------------
+
+def _find_entry(description: str, action: str = "delete") -> dict:
+    """The one entry a spoken phrase means, from the last 30 days.
+
+    Everything that stops a caller from proceeding -- nothing said, nothing
+    logged, no match, or a tie -- comes back as a `WorkoutError` carrying the
+    words to say, so both tools answer identically for all of them. `action` is
+    the verb those words use ("delete", "change").
+    """
+    said = (description or "").strip()
+    if not said:
+        raise WorkoutError(f"Tell me which entry to {action}.")
+
+    since = (_today() - timedelta(days=30)).isoformat()
+    rows = _load_entries("WHERE e.date >= ?", (since,))
+    if not rows:
+        raise WorkoutError(
+            f"There's nothing logged in the last 30 days to {action}.")
+
+    # A date mentioned in the request narrows before the name is matched --
+    # "yesterday's run" and "today's run" are otherwise identical strings to a
+    # name matcher, and acting on the wrong day is exactly the mistake these
+    # tools exist to fix.
+    wanted_day: date | None = None
+    for phrase in ("day before yesterday", "yesterday", "today", "tonight",
+                   "last night", *_WEEKDAYS):
+        if re.search(rf"\b{re.escape(phrase)}\b", said, re.I):
+            try:
+                wanted_day = _parse_date(phrase)
+            except WorkoutError:
+                wanted_day = None
+            break
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", said)
+    if m:
+        wanted_day = _iso(m.group(1))
+
+    pool = [r for r in rows if r["date"] == wanted_day.isoformat()] \
+        if wanted_day else list(rows)
+    if wanted_day and not pool:
+        raise WorkoutError(f"Nothing logged {_say_date(wanted_day)}.")
+
+    # Strip the date words out before matching the name, so "today's bench"
+    # scores against "bench" and not against "today s bench".
+    name_part = said
+    for phrase in ("day before yesterday", "yesterday", "today", "tonight",
+                   "last night", "the", "from", "on", *_WEEKDAYS):
+        name_part = re.sub(rf"\b{re.escape(phrase)}(?:'s|s)?\b", " ",
+                           name_part, flags=re.I)
+    name_part = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", name_part)
+    key = _norm(name_part) or _norm(said)
+
+    scored = []
+    for r in pool:
+        norm = _norm(r["name"])
+        words, said_words = set(norm.split()), set(key.split())
+        # Same word rules as `_find_exercise`, so "the bench" finds what
+        # "bench" logged rather than scoring it as a near-miss.
+        if _covers(said_words, words) or _covers(words, said_words):
+            score = 1.0
+        else:
+            score = difflib.SequenceMatcher(None, key, norm).ratio()
+        # The whole line, so "3 sets of 8" or a note can disambiguate two
+        # entries for the same exercise on the same day.
+        line = _norm(f"{r['name']} {_describe(r)}")
+        score = max(score, difflib.SequenceMatcher(None, key, line).ratio())
+        scored.append((score, r))
+
+    scored.sort(key=lambda t: -t[0])
+    if not scored or scored[0][0] < 0.5:
+        raise WorkoutError(f"I couldn't find an entry matching '{said}' in the "
+                           f"last 30 days.")
+
+    best = scored[0][0]
+    tied = [r for score, r in scored if score >= best - 0.001]
+    if len(tied) > 1:
+        # Same exercise, same day, logged twice -- there is no safe way to
+        # guess which, so list them rather than acting on the wrong one.
+        listing = "; ".join(
+            f"{_say_date(_iso(r['date']))} {_entry_line(r)}"
+            for r in tied[:5])
+        raise WorkoutError(f"More than one entry matches '{said}': {listing}. "
+                           f"Which one?")
+    return tied[0]
 
 
 # Everything `_migrate_v1` reaches for now exists, so the database can be
@@ -1372,80 +1523,11 @@ def delete_log_entry(description: str) -> str:
             "the 5k from Monday", "squats".
     """
     logger.info("delete_log_entry: %r", description)
-    said = (description or "").strip()
-    if not said:
-        return "Tell me which entry to delete."
+    try:
+        row = _find_entry(description, "delete")
+    except WorkoutError as err:
+        return str(err)
 
-    since = (_today() - timedelta(days=30)).isoformat()
-    rows = _load_entries("WHERE e.date >= ?", (since,))
-    if not rows:
-        return "There's nothing logged in the last 30 days to delete."
-
-    # A date mentioned in the request narrows before the name is matched --
-    # "yesterday's run" and "today's run" are otherwise identical strings to a
-    # name matcher, and deleting the wrong day is exactly the mistake this
-    # tool exists to fix.
-    wanted_day: date | None = None
-    for phrase in ("day before yesterday", "yesterday", "today", "tonight",
-                   "last night", *_WEEKDAYS):
-        if re.search(rf"\b{re.escape(phrase)}\b", said, re.I):
-            try:
-                wanted_day = _parse_date(phrase)
-            except WorkoutError:
-                wanted_day = None
-            break
-    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", said)
-    if m:
-        wanted_day = _iso(m.group(1))
-
-    pool = [r for r in rows if r["date"] == wanted_day.isoformat()] \
-        if wanted_day else list(rows)
-    if wanted_day and not pool:
-        return f"Nothing logged {_say_date(wanted_day)}."
-
-    # Strip the date words out before matching the name, so "today's bench"
-    # scores against "bench" and not against "today s bench".
-    name_part = said
-    for phrase in ("day before yesterday", "yesterday", "today", "tonight",
-                   "last night", "the", "from", "on", *_WEEKDAYS):
-        name_part = re.sub(rf"\b{re.escape(phrase)}(?:'s|s)?\b", " ",
-                           name_part, flags=re.I)
-    name_part = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", name_part)
-    key = _norm(name_part) or _norm(said)
-
-    scored = []
-    for r in pool:
-        norm = _norm(r["name"])
-        words, said_words = set(norm.split()), set(key.split())
-        # Same word rules as `_find_exercise`, so "the bench" deletes what
-        # "bench" logged rather than scoring it as a near-miss.
-        if _covers(said_words, words) or _covers(words, said_words):
-            score = 1.0
-        else:
-            score = difflib.SequenceMatcher(None, key, norm).ratio()
-        # The whole line, so "3 sets of 8" or a note can disambiguate two
-        # entries for the same exercise on the same day.
-        line = _norm(f"{r['name']} {_describe(r)}")
-        score = max(score, difflib.SequenceMatcher(None, key, line).ratio())
-        scored.append((score, r))
-
-    scored.sort(key=lambda t: -t[0])
-    if not scored or scored[0][0] < 0.5:
-        return (f"I couldn't find an entry matching '{said}' in the last "
-                f"30 days.")
-
-    best = scored[0][0]
-    tied = [r for score, r in scored if score >= best - 0.001]
-    if len(tied) > 1:
-        # Same exercise, same day, logged twice -- there is no safe way to
-        # guess which, so list them rather than deleting the wrong one.
-        listing = "; ".join(
-            f"{_say_date(_iso(r['date']))} {_entry_line(r)}"
-            for r in tied[:5])
-        return (f"More than one entry matches '{said}': {listing}. "
-                f"Which one?")
-
-    row = tied[0]
     # The entry's set rows go with it, via ON DELETE CASCADE -- which only
     # fires because `_init_db` turns foreign keys on.
     _write("DELETE FROM entries WHERE id = ?", (row["id"],))
@@ -1463,6 +1545,140 @@ def delete_log_entry(description: str) -> str:
         also = (f" That was the only {row['name']} entry, so I dropped it "
                 f"from the exercise list too.")
     return f"Deleted {line} from {when}.{also}"
+
+
+@mcp.tool
+def edit_log_entry(description: str, exercise: str = "", sets: str = "",
+                   reps: str = "", weight: str = "", duration: str = "",
+                   distance: str = "", steps: str = "", notes: str = "",
+                   date: str = "") -> str:
+    """Correct something already logged, in place.
+
+    Use this when the entry belongs but something about it is wrong -- the
+    weight was 145 not 140, it went down on the wrong day, or it landed on
+    the wrong exercise. `delete_log_entry` is for the other case: an entry
+    that shouldn't exist at all.
+
+    Say which entry the same way you'd say it to delete one -- "today's
+    bench press", "yesterday's run" -- then give only the fields that change.
+    Anything left empty keeps what it already says. Changing any of sets,
+    reps or weight rewrites that entry's sets, carrying over whichever of the
+    three you didn't mention, so fixing just the weight keeps the reps.
+
+    Args:
+        description: Which entry to fix, e.g. "today's bench press",
+            "the 5k from Monday", "squats". Required.
+        exercise: Move it onto a different exercise, e.g. "hip adductor".
+            Matched on the exact name only -- anything else starts a new
+            exercise -- which is what makes this able to undo a wrong match.
+            Leave empty to keep the exercise it's on.
+        sets: How many sets, e.g. "3".
+        reps: Reps, e.g. "8", or per-set "8, 8, 6".
+        weight: Weight, e.g. "185", "185 lbs", "bodyweight", "45 kg".
+        duration: How long, e.g. "30 min", "1h 10", "22:30".
+        distance: How far, e.g. "3.1 miles", "5k", "400m".
+        steps: How many steps, e.g. "2000".
+        notes: Replacement notes for the entry.
+        date: Move it to another day, e.g. "yesterday", "Monday",
+            "2026-09-02".
+    """
+    logger.info("edit_log_entry: %r exercise=%r sets=%r reps=%r weight=%r "
+                "duration=%r distance=%r steps=%r notes=%r date=%r",
+                description, exercise, sets, reps, weight, duration, distance,
+                steps, notes, date)
+
+    # Only fields actually passed are touched, so the ones that were passed are
+    # the whole instruction -- and none of them means there is no instruction.
+    given = {name: value.strip() for name, value in (
+        ("exercise", exercise), ("sets", sets), ("reps", reps),
+        ("weight", weight), ("duration", duration), ("distance", distance),
+        ("steps", steps), ("notes", notes), ("date", date))
+        if (value or "").strip()}
+    if not given:
+        return ("Tell me what to change as well -- the weight, the reps, the "
+                "exercise, the date, and so on.")
+
+    try:
+        entry = _find_entry(description, "change")
+    except WorkoutError as err:
+        return str(err)
+
+    fields: dict = {}
+    plan: list[tuple] | None = None
+    moved_from = ""
+    try:
+        if "date" in given:
+            fields["date"] = _parse_date(given["date"]).isoformat()
+        if "duration" in given:
+            fields["duration_seconds"] = _parse_seconds(given["duration"])
+        if "distance" in given:
+            dist = _distance(given["distance"])
+            fields["distance_value"] = dist[0] if dist else None
+            fields["distance_unit"] = dist[1] if dist else None
+        if "steps" in given:
+            fields["steps"] = _parse_steps(given["steps"])
+        if "notes" in given:
+            fields["notes"] = given["notes"]
+
+        if {"sets", "reps", "weight"} & set(given):
+            seed = _seed_sets(entry["sets"])
+            plan, leftover = _plan_sets(given.get("sets", seed[0]),
+                                        given.get("reps", seed[1]),
+                                        given.get("weight", seed[2]))
+            # Words said in the reps field that aren't a count -- "to failure"
+            # -- join the notes, exactly as they do on the way in.
+            note = fields.get("notes", entry["notes"] or "")
+            if leftover and leftover not in note:
+                fields["notes"] = "; ".join(filter(None, (note, leftover)))
+
+        if "exercise" in given:
+            # EXACT NORMALIZED NAME ONLY here, never `_find_exercise`. Its word
+            # and fuzzy passes are tuned for a lossy voice transcript, and they
+            # are what puts an entry on the wrong exercise in the first place:
+            # "hip adductor" scores 0.92 against "Hip Abductor", far over the
+            # 0.75 cutoff, though those are opposite muscles rather than a
+            # typo. A tool whose job is repairing that match must not be able
+            # to reproduce it, so a name that isn't already known mints a new
+            # exercise rather than finding the nearest one.
+            key = _norm(given["exercise"])
+            hit = _query("SELECT * FROM exercises WHERE norm = ?",
+                         (key,)) if key else []
+            target = hit[0] if hit else _create_exercise(given["exercise"])
+            if target["id"] != entry["exercise_id"]:
+                fields["exercise_id"] = target["id"]
+                moved_from = entry["name"]
+    except WorkoutError as err:
+        return str(err)
+    except sqlite3.Error as err:
+        logger.error("edit_log_entry failed: %s", err)
+        return "I couldn't change that -- the workout database wouldn't take it."
+
+    try:
+        _update_entry(entry["id"], fields, plan)
+    except sqlite3.Error as err:
+        logger.error("edit_log_entry update failed: %s", err)
+        return "I couldn't change that -- the workout database wouldn't take it."
+
+    # Same cleanup as a delete, for the same reason: an exercise the entry has
+    # just left with nothing else on it exists only because of the bad match
+    # being corrected, and would otherwise stay a fuzzy-match target forever.
+    also = ""
+    if moved_from:
+        left = _query("SELECT COUNT(*) AS n FROM entries WHERE exercise_id = ?",
+                      (entry["exercise_id"],))[0]["n"]
+        if left == 0:
+            _write("DELETE FROM exercises WHERE id = ?",
+                   (entry["exercise_id"],))
+            also = (f" That was the only {moved_from} entry, so I dropped it "
+                    f"from the exercise list too.")
+
+    saved = _load_entries("WHERE e.id = ?", (entry["id"],))[0]
+    detail = _describe(saved)
+    when = _iso(saved["date"])
+    when_str = "" if when == _today() else f" for {_say_date(when)}"
+    moved = f" Moved from {moved_from} to {saved['name']}." if moved_from else ""
+    return (f"Updated: {saved['name']}{f' -- {detail}' if detail else ''}"
+            f"{when_str}.{moved}{also}")
 
 
 # ---------------------------------------------------------------------------
