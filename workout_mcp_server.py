@@ -1750,8 +1750,20 @@ async def api_log(request: Request) -> JSONResponse:
     rows = _load_entries("WHERE e.date >= ?", (since,))
     by_day: dict[str, list[dict]] = {}
     for r in rows:
-        by_day.setdefault(r["date"], []).append(
-            {"name": r["name"], "detail": _describe(r)})
+        by_day.setdefault(r["date"], []).append({
+            "name": r["name"],
+            "detail": _describe(r),
+            # The sentence and the raw numbers behind it. The dashboard shows
+            # one block per exercise per day, merging sets that repeat across
+            # separate entries, and it cannot do that from a formatted string.
+            # `detail` stays because anything that isn't a straight lift --
+            # cardio, steps, bodyweight -- still renders from it verbatim.
+            # Purely additive: the rows themselves are untouched.
+            "notes": (r["notes"] or "").strip(),
+            "sets": [{"reps": s["reps"],
+                      "weight_value": s["weight_value"],
+                      "weight_unit": s["weight_unit"]} for s in r["sets"]],
+        })
     return JSONResponse({"days": [{"date": d, "entries": v}
                                   for d, v in by_day.items()]})
 

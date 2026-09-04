@@ -107,6 +107,10 @@
   ul.hist li:first-child { border-top: 0; }
   ul.hist .when { color: var(--muted); flex: 0 0 84px; }
   ul.hist .what { flex: 1; }
+  /* A lift logged in several calls on one day is one block with a line per
+     distinct set, so the name isn't repeated down the card. */
+  ul.hist .lines { display: block; padding-left: 10px; margin-top: 2px; }
+  ul.hist .lines > span { display: block; }
 
   .dayhead {
     font-size: 12px; font-weight: 700; text-transform: uppercase;
@@ -340,6 +344,65 @@
     });
   }
 
+  // A weight the way the server's _trim() would say it: 205.0 -> "205",
+  // 1000 -> "1,000", 3.10 -> "3.1". Kept separate from fmt() because that one
+  // rounds to a single decimal and always appends "lbs".
+  function trimWeight(v) {
+    return Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  }
+
+  // Only a straight lift can be merged: every set has to carry both a rep
+  // count and a weight. A run, a Stairmaster session or a bodyweight set has
+  // nothing to line up on, so those fall through to their own `detail`.
+  function isLift(e) {
+    return !!(e.sets && e.sets.length) && e.sets.every(function (s) {
+      return s.reps != null && s.weight_value != null;
+    });
+  }
+
+  // One day's entries as display blocks -- presentation only, the rows behind
+  // them are exactly as logged. Entries sharing an exercise name become one
+  // block; inside it, sets agreeing on reps, weight and note collapse to a
+  // single "2 sets of 10 at 205 lbs" line. Phrasing matches _describe() on the
+  // server, so a lift logged in one call reads identically either way.
+  function groupDay(entries) {
+    var order = [], byName = {};
+    entries.forEach(function (e) {
+      if (!byName[e.name]) { byName[e.name] = []; order.push(e.name); }
+      byName[e.name].push(e);
+    });
+    return order.map(function (name) {
+      var group = byName[name];
+      if (!group.every(isLift)) {
+        return { name: name, lines: group.map(function (e) {
+          return e.detail || "";
+        }) };
+      }
+      // The API sends a day newest-first, so a group only reads in the order
+      // it was actually logged once reversed. Sets within one entry are
+      // already in set_index order.
+      var keys = [], runs = {};
+      group.slice().reverse().forEach(function (e) {
+        e.sets.forEach(function (s) {
+          var unit = s.weight_unit || "lbs", note = e.notes || "";
+          var key = [s.reps, s.weight_value, unit, note].join(" ");
+          if (!runs[key]) {
+            keys.push(key);
+            runs[key] = { n: 0, reps: s.reps, weight: s.weight_value,
+                          unit: unit, note: note };
+          }
+          runs[key].n += 1;
+        });
+      });
+      return { name: name, lines: keys.map(function (k) {
+        var r = runs[k];
+        var line = (r.n > 1 ? r.n + " sets of " + r.reps : r.reps + " reps") +
+                   " at " + trimWeight(r.weight) + " " + r.unit;
+        return r.note ? line + " (" + r.note + ")" : line;
+      }) };
+    });
+  }
+
   function renderLog() {
     if (!logDays.length) {
       view.innerHTML = '<div class="empty">Nothing logged in the last two ' +
@@ -351,10 +414,19 @@
       html += '<section class="card"><div class="dayhead">' +
               esc(sayDay(day.date)) + '</div><ul class="hist" ' +
               'style="padding:6px 14px 12px">';
-      day.entries.forEach(function (e) {
-        html += '<li><span class="what"><strong>' + esc(e.name) +
-                '</strong>' + (e.detail ? " " + esc(e.detail) : "") +
-                '</span></li>';
+      groupDay(day.entries).forEach(function (g) {
+        // One line stays on the name's own row, exactly as before; only a
+        // block that really has several lines stacks them underneath.
+        var body;
+        if (g.lines.length === 1) {
+          body = g.lines[0] ? " " + esc(g.lines[0]) : "";
+        } else {
+          body = '<span class="lines">' + g.lines.map(function (l) {
+            return "<span>" + esc(l) + "</span>";
+          }).join("") + "</span>";
+        }
+        html += '<li><span class="what"><strong>' + esc(g.name) +
+                '</strong>' + body + '</span></li>';
       });
       html += "</ul></section>";
     });
